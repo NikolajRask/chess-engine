@@ -1,0 +1,6 @@
+build/
+web/node_modules/
+web/dist/
+.DS_Store
+*.o
+*.a
