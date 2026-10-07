@@ -29,6 +29,11 @@ bool isQuiet(const Move& m) {
   return !isCapture(m) && m.promotion == PieceType::None;
 }
 
+// Margins in centipawns.
+constexpr int kRazorMargin[] = {0, 300, 450, 600};
+constexpr int kReverseFutilityMargin[] = {0, 150, 300, 500, 700, 900, 1100};
+constexpr int kFutilityMargin[] = {0, 150, 300, 450, 600, 750, 900};
+
 }  // namespace
 
 bool Searcher::shouldStop() const {
@@ -38,6 +43,23 @@ bool Searcher::shouldStop() const {
   const auto ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(now - start_).count();
   return ms >= limits_.timeMs;
+}
+
+bool Searcher::isRepetition(const Position& pos) const {
+  const int half = pos.halfmoveClock();
+  if (half < 4 || repHistory_.size() < 2) return false;
+  const Bitboard key = pos.hash();
+  int hits = 0;
+  // Walk back through reversible moves; skip the current entry at the end.
+  const int start = static_cast<int>(repHistory_.size()) - 2;
+  const int oldest = std::max(0, static_cast<int>(repHistory_.size()) - 1 - half);
+  for (int i = start; i >= oldest; i -= 2) {
+    if (repHistory_[static_cast<size_t>(i)] == key) {
+      ++hits;
+      if (hits >= 1) return true;  // occurred earlier in the path → drawish
+    }
+  }
+  return false;
 }
 
 int Searcher::scoreToTT(int score, int ply) const {
@@ -52,8 +74,8 @@ int Searcher::scoreFromTT(int score, int ply) const {
   return score;
 }
 
-void Searcher::storeTT(Bitboard key, int score, int depth, int flag,
-                       const Move& best, int ply) {
+void Searcher::storeTT(Bitboard key, int score, int depth, int flag, const Move& best,
+                       int ply) {
   TTEntry& e = tt_[key % kTTSize];
   if (e.key == key && e.depth > depth) return;
   e.key = key;
@@ -63,8 +85,8 @@ void Searcher::storeTT(Bitboard key, int score, int depth, int flag,
   e.bestMove = best;
 }
 
-bool Searcher::probeTT(Bitboard key, int depth, int alpha, int beta, int ply,
-                       int& score, Move& ttMove) {
+bool Searcher::probeTT(Bitboard key, int depth, int alpha, int beta, int ply, int& score,
+                       Move& ttMove) {
   TTEntry& e = tt_[key % kTTSize];
   if (e.key != key) return false;
   ttMove = e.bestMove;
@@ -94,7 +116,12 @@ SearchResult Searcher::search(Position& root, SearchLimits limits) {
   nodes_ = 0;
   if (tt_.size() != kTTSize) tt_.assign(kTTSize, {});
   std::fill(&killers_[0][0], &killers_[0][0] + 128 * 2, Move{});
+  std::fill(&counters_[0][0], &counters_[0][0] + 64 * 64, Move{});
+  std::fill(plyMove_, plyMove_ + 128, Move{});
   std::memset(history_, 0, sizeof(history_));
+
+  repHistory_.clear();
+  repHistory_.push_back(root.hash());
 
   std::vector<Move> rootMoves;
   MoveGen::generateLegal(root, rootMoves);
@@ -157,7 +184,7 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
   }
 
   ++nodes_;
-  if (pos.isDraw()) return 0;
+  if (pos.isDraw() || isRepetition(pos)) return 0;
   if (ply >= 120) return evaluate(pos);
 
   const bool inCheck = pos.inCheck(pos.sideToMove());
@@ -174,12 +201,28 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
 
   const int staticEval = evaluate(pos);
 
+  // Reverse futility pruning (static null-move).
+  if (!inCheck && depth <= 6 && ply > 0 && beta < kMateScore - 1000) {
+    const int margin = kReverseFutilityMargin[depth];
+    if (staticEval - margin >= beta) return staticEval;
+  }
+
+  // Razoring: if eval is far below alpha, drop into quiescence.
+  if (!inCheck && depth <= 3 && ply > 0) {
+    const int razor = staticEval + kRazorMargin[depth];
+    if (razor <= alpha) {
+      const int q = quiescence(pos, alpha, beta, ply);
+      if (q <= alpha) return q;
+    }
+  }
+
   // Null-move pruning.
   if (allowNull && !inCheck && depth >= 3 && beta < kInf - 100 &&
       pos.hasNonPawnMaterial(pos.sideToMove()) && staticEval >= beta) {
     const int R = 2 + depth / 4;
     NullUndo nundo;
     pos.makeNullMove(nundo);
+    // Null moves skip side; don't push to repetition stack.
     const int score = -negamax(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
     pos.unmakeNullMove(nundo);
     if (stop_) return evaluate(pos);
@@ -199,12 +242,24 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
   Move bestMove = moves.front();
   int flag = 1;
   int moveIndex = 0;
+  int quietCount = 0;
 
   Undo undo;
   for (const Move& m : moves) {
     const bool quiet = isQuiet(m);
 
+    // Futility pruning of late quiet moves near the leaves.
+    if (!inCheck && quiet && depth <= 6 && ply > 0 && best > -kMateScore + 1000) {
+      const int futility = staticEval + kFutilityMargin[depth];
+      if (futility <= alpha && quietCount >= 1) {
+        ++moveIndex;
+        continue;
+      }
+    }
+
     pos.makeMove(m, undo);
+    repHistory_.push_back(pos.hash());
+    plyMove_[ply] = m;
     const bool givesChk = pos.inCheck(pos.sideToMove());
 
     int score;
@@ -226,7 +281,9 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
       }
     }
 
+    repHistory_.pop_back();
     pos.unmakeMove(m, undo);
+    if (quiet) ++quietCount;
     ++moveIndex;
 
     if (stop_) return evaluate(pos);
@@ -246,6 +303,12 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
         killers_[ply][1] = killers_[ply][0];
         killers_[ply][0] = m;
         history_[static_cast<int>(m.from)][static_cast<int>(m.to)] += depth * depth;
+        if (ply > 0) {
+          const Move prev = plyMove_[ply - 1];
+          if (prev.from != Square::None) {
+            counters_[static_cast<int>(prev.from)][static_cast<int>(prev.to)] = m;
+          }
+        }
       }
       break;
     }
@@ -261,6 +324,7 @@ int Searcher::quiescence(Position& pos, int alpha, int beta, int ply) {
     return evaluate(pos);
   }
   ++nodes_;
+  if (pos.isDraw() || isRepetition(pos)) return 0;
   if (ply >= 120) return evaluate(pos);
 
   const bool inCheck = pos.inCheck(pos.sideToMove());
@@ -275,9 +339,7 @@ int Searcher::quiescence(Position& pos, int alpha, int beta, int ply) {
 
   if (inCheck) {
     if (moves.empty()) return -kMateScore + ply;
-    // While in check, search all legal escapes.
   } else {
-    // Captures and promotions only; prune clearly losing captures with SEE.
     moves.erase(std::remove_if(moves.begin(), moves.end(),
                                [&](const Move& m) {
                                  if (!(isCapture(m) || m.promotion != PieceType::None))
@@ -292,7 +354,9 @@ int Searcher::quiescence(Position& pos, int alpha, int beta, int ply) {
   Undo undo;
   for (const Move& m : moves) {
     pos.makeMove(m, undo);
+    repHistory_.push_back(pos.hash());
     const int score = -quiescence(pos, -beta, -alpha, ply + 1);
+    repHistory_.pop_back();
     pos.unmakeMove(m, undo);
     if (stop_) return evaluate(pos);
     if (score >= beta) return beta;
@@ -303,6 +367,14 @@ int Searcher::quiescence(Position& pos, int alpha, int beta, int ply) {
 
 void Searcher::orderMoves(Position& pos, std::vector<Move>& moves, const Move& ttMove,
                           int ply) {
+  Move counter{};
+  if (ply > 0) {
+    const Move prev = plyMove_[ply - 1];
+    if (prev.from != Square::None) {
+      counter = counters_[static_cast<int>(prev.from)][static_cast<int>(prev.to)];
+    }
+  }
+
   auto scoreMove = [&](const Move& m) {
     if (m.from == ttMove.from && m.to == ttMove.to && m.promotion == ttMove.promotion)
       return 1000000;
@@ -311,6 +383,9 @@ void Searcher::orderMoves(Position& pos, std::vector<Move>& moves, const Move& t
     }
     if (killers_[ply][0] == m) return 400000;
     if (killers_[ply][1] == m) return 390000;
+    if (counter.from == m.from && counter.to == m.to &&
+        counter.promotion == m.promotion)
+      return 380000;
     return history_[static_cast<int>(m.from)][static_cast<int>(m.to)];
   };
 

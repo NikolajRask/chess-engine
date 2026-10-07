@@ -28,6 +28,7 @@ class Position {
   Color sideToMove() const { return stm_; }
   Square epSquare() const { return epSquare_; }
   int castlingRights() const { return castling_; }
+  int halfmoveClock() const { return halfmove_; }
   Bitboard hash() const { return hash_; }
 
   Piece pieceOn(Square sq) const;

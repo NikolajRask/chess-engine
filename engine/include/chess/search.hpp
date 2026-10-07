@@ -36,24 +36,26 @@ class Searcher {
 
  private:
   static constexpr int kMaxDepth = 64;
-  static constexpr size_t kTTSize = 1 << 22;  // 4M entries
+  static constexpr size_t kTTSize = 1 << 22;
   static constexpr int kMateScore = 30000;
   static constexpr int kInf = 32000;
 
   int negamax(Position& pos, int depth, int alpha, int beta, int ply, bool allowNull);
   int quiescence(Position& pos, int alpha, int beta, int ply);
-  void orderMoves(Position& pos, std::vector<Move>& moves, const Move& ttMove,
-                  int ply);
+  void orderMoves(Position& pos, std::vector<Move>& moves, const Move& ttMove, int ply);
   bool shouldStop() const;
+  bool isRepetition(const Position& pos) const;
   int scoreToTT(int score, int ply) const;
   int scoreFromTT(int score, int ply) const;
-  void storeTT(Bitboard key, int score, int depth, int flag, const Move& best,
-               int ply);
+  void storeTT(Bitboard key, int score, int depth, int flag, const Move& best, int ply);
   bool probeTT(Bitboard key, int depth, int alpha, int beta, int ply, int& score,
                Move& ttMove);
 
   std::vector<TTEntry> tt_;
+  std::vector<Bitboard> repHistory_;
   Move killers_[128][2]{};
+  Move counters_[64][64]{};
+  Move plyMove_[128]{};
   int history_[64][64]{};
 
   std::chrono::steady_clock::time_point start_;
