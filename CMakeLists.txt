@@ -7,6 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_subdirectory(engine)
 add_subdirectory(server)
+add_subdirectory(uci)
 
 enable_testing()
 add_subdirectory(engine/tests)

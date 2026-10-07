@@ -30,7 +30,16 @@ Bitboard pawnDoublePush(Color c, Bitboard pawns, Bitboard empty) {
   return forwardPawns(c, single & rank3) & empty;
 }
 
-void generatePseudo(Position& pos, std::vector<Move>& moves) {
+Bitboard friendlyOcc(const Position& pos, int usIdx) {
+  return pos.pieces(static_cast<Piece>(usIdx + 1)) |
+         pos.pieces(static_cast<Piece>(usIdx + 2)) |
+         pos.pieces(static_cast<Piece>(usIdx + 3)) |
+         pos.pieces(static_cast<Piece>(usIdx + 4)) |
+         pos.pieces(static_cast<Piece>(usIdx + 5)) |
+         pos.pieces(static_cast<Piece>(usIdx + 6));
+}
+
+void generatePseudo(Position& pos, std::vector<Move>& moves, bool capturesOnly) {
   moves.clear();
   const Color us = pos.sideToMove();
   const Color them = opposite(us);
@@ -38,6 +47,7 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
   const Bitboard empty = ~occ;
 
   const int usIdx = us == Color::White ? 0 : 6;
+  const Bitboard friendly = friendlyOcc(pos, usIdx);
   const Bitboard ourPawns = pos.pieces(static_cast<Piece>(usIdx + 1));
   const Bitboard ourKnights = pos.pieces(static_cast<Piece>(usIdx + 2));
   const Bitboard ourBishops = pos.pieces(static_cast<Piece>(usIdx + 3));
@@ -54,29 +64,25 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
     if (toSingle) {
       const Square to = bb::lsbSquare(toSingle);
       if (rankOf(to) == (us == Color::White ? 7 : 0)) {
+        // Quiet promotions matter in qsearch.
         for (PieceType pt :
              {PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight}) {
-          Move m{from, to, pt, MoveFlag::Promotion, Piece::None};
-          addMove(moves, m);
+          addMove(moves, Move{from, to, pt, MoveFlag::Promotion, Piece::None});
         }
-      } else {
+      } else if (!capturesOnly) {
         addMove(moves, Move{from, to, PieceType::None, MoveFlag::Quiet, Piece::None});
       }
     }
-    const Bitboard toDouble =
-        pawnDoublePush(us, 1ULL << static_cast<int>(from), empty);
-    if (toDouble) {
-      addMove(moves, Move{from, bb::lsbSquare(toDouble), PieceType::None,
-                          MoveFlag::DoublePawnPush, Piece::None});
+    if (!capturesOnly) {
+      const Bitboard toDouble =
+          pawnDoublePush(us, 1ULL << static_cast<int>(from), empty);
+      if (toDouble) {
+        addMove(moves, Move{from, bb::lsbSquare(toDouble), PieceType::None,
+                            MoveFlag::DoublePawnPush, Piece::None});
+      }
     }
 
-    const Bitboard enemyOcc =
-        occ & ~(pos.pieces(static_cast<Piece>(usIdx + 1)) |
-                pos.pieces(static_cast<Piece>(usIdx + 2)) |
-                pos.pieces(static_cast<Piece>(usIdx + 3)) |
-                pos.pieces(static_cast<Piece>(usIdx + 4)) |
-                pos.pieces(static_cast<Piece>(usIdx + 5)) |
-                pos.pieces(static_cast<Piece>(usIdx + 6)));
+    const Bitboard enemyOcc = occ & ~friendly;
     Bitboard attacks =
         bb::pawnAttacks[static_cast<int>(us)][static_cast<int>(from)] & enemyOcc;
     while (attacks) {
@@ -93,7 +99,6 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
                             pos.pieceOn(to)});
       }
     }
-
   }
 
   if (pos.epSquare() != Square::None) {
@@ -117,20 +122,8 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
   while (bb) {
     const Square from = bb::lsbSquare(bb);
     bb &= bb - 1;
-    Bitboard attacks = bb::knightAttacks[static_cast<int>(from)] & ~pos.pieces(static_cast<Piece>(usIdx + 1)) &
-                       ~pos.pieces(static_cast<Piece>(usIdx + 2)) &
-                       ~pos.pieces(static_cast<Piece>(usIdx + 3)) &
-                       ~pos.pieces(static_cast<Piece>(usIdx + 4)) &
-                       ~pos.pieces(static_cast<Piece>(usIdx + 5)) &
-                       ~pos.pieces(static_cast<Piece>(usIdx + 6));
-    // simpler: attacks & ~friendly
-    attacks = bb::knightAttacks[static_cast<int>(from)] & ~(
-        pos.pieces(static_cast<Piece>(usIdx + 1)) |
-        pos.pieces(static_cast<Piece>(usIdx + 2)) |
-        pos.pieces(static_cast<Piece>(usIdx + 3)) |
-        pos.pieces(static_cast<Piece>(usIdx + 4)) |
-        pos.pieces(static_cast<Piece>(usIdx + 5)) |
-        pos.pieces(static_cast<Piece>(usIdx + 6)));
+    Bitboard attacks = bb::knightAttacks[static_cast<int>(from)] & ~friendly;
+    if (capturesOnly) attacks &= occ;
     while (attacks) {
       const Square to = bb::lsbSquare(attacks);
       attacks &= attacks - 1;
@@ -146,13 +139,8 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
     while (s) {
       const Square from = bb::lsbSquare(s);
       s &= s - 1;
-      Bitboard attacks = bb::slidingAttacks(from, occ, bishop);
-      attacks &= ~(pos.pieces(static_cast<Piece>(usIdx + 1)) |
-                   pos.pieces(static_cast<Piece>(usIdx + 2)) |
-                   pos.pieces(static_cast<Piece>(usIdx + 3)) |
-                   pos.pieces(static_cast<Piece>(usIdx + 4)) |
-                   pos.pieces(static_cast<Piece>(usIdx + 5)) |
-                   pos.pieces(static_cast<Piece>(usIdx + 6)));
+      Bitboard attacks = bb::slidingAttacks(from, occ, bishop) & ~friendly;
+      if (capturesOnly) attacks &= occ;
       while (attacks) {
         const Square to = bb::lsbSquare(attacks);
         attacks &= attacks - 1;
@@ -171,13 +159,10 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
   while (queens) {
     const Square from = bb::lsbSquare(queens);
     queens &= queens - 1;
-    Bitboard attacks = bb::slidingAttacks(from, occ, true) | bb::slidingAttacks(from, occ, false);
-    attacks &= ~(pos.pieces(static_cast<Piece>(usIdx + 1)) |
-                 pos.pieces(static_cast<Piece>(usIdx + 2)) |
-                 pos.pieces(static_cast<Piece>(usIdx + 3)) |
-                 pos.pieces(static_cast<Piece>(usIdx + 4)) |
-                 pos.pieces(static_cast<Piece>(usIdx + 5)) |
-                 pos.pieces(static_cast<Piece>(usIdx + 6)));
+    Bitboard attacks =
+        (bb::slidingAttacks(from, occ, true) | bb::slidingAttacks(from, occ, false)) &
+        ~friendly;
+    if (capturesOnly) attacks &= occ;
     while (attacks) {
       const Square to = bb::lsbSquare(attacks);
       attacks &= attacks - 1;
@@ -191,13 +176,8 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
   while (bb) {
     const Square from = bb::lsbSquare(bb);
     bb &= bb - 1;
-    Bitboard attacks = bb::kingAttacks[static_cast<int>(from)] &
-                       ~(pos.pieces(static_cast<Piece>(usIdx + 1)) |
-                         pos.pieces(static_cast<Piece>(usIdx + 2)) |
-                         pos.pieces(static_cast<Piece>(usIdx + 3)) |
-                         pos.pieces(static_cast<Piece>(usIdx + 4)) |
-                         pos.pieces(static_cast<Piece>(usIdx + 5)) |
-                         pos.pieces(static_cast<Piece>(usIdx + 6)));
+    Bitboard attacks = bb::kingAttacks[static_cast<int>(from)] & ~friendly;
+    if (capturesOnly) attacks &= occ;
     while (attacks) {
       const Square to = bb::lsbSquare(attacks);
       attacks &= attacks - 1;
@@ -207,7 +187,7 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
                           cap});
     }
 
-    if (!pos.inCheck(us)) {
+    if (!capturesOnly && !pos.inCheck(us)) {
       const int rights = pos.castlingRights();
       if (us == Color::White && from == Square::E1) {
         if ((rights & kCastleWK) && !(occ & ((1ULL << static_cast<int>(Square::F1)) |
@@ -247,14 +227,7 @@ void generatePseudo(Position& pos, std::vector<Move>& moves) {
   }
 }
 
-}  // namespace
-
-void MoveGen::generatePseudoLegal(Position& pos, std::vector<Move>& moves) {
-  generatePseudo(pos, moves);
-}
-
-void MoveGen::generateLegal(Position& pos, std::vector<Move>& moves) {
-  generatePseudo(pos, moves);
+void filterLegal(Position& pos, std::vector<Move>& moves) {
   std::vector<Move> legal;
   legal.reserve(moves.size());
   Undo undo;
@@ -266,6 +239,22 @@ void MoveGen::generateLegal(Position& pos, std::vector<Move>& moves) {
     pos.unmakeMove(m, undo);
   }
   moves.swap(legal);
+}
+
+}  // namespace
+
+void MoveGen::generatePseudoLegal(Position& pos, std::vector<Move>& moves) {
+  generatePseudo(pos, moves, false);
+}
+
+void MoveGen::generateLegal(Position& pos, std::vector<Move>& moves) {
+  generatePseudo(pos, moves, false);
+  filterLegal(pos, moves);
+}
+
+void MoveGen::generateLegalCaptures(Position& pos, std::vector<Move>& moves) {
+  generatePseudo(pos, moves, true);
+  filterLegal(pos, moves);
 }
 
 int perft(Position& pos, int depth) {

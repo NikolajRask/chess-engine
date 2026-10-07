@@ -31,6 +31,12 @@ class Position {
   int halfmoveClock() const { return halfmove_; }
   Bitboard hash() const { return hash_; }
 
+  // Incremental material + PST (White − Black) and game phase.
+  int scoreMg() const { return scoreMg_; }
+  int scoreEg() const { return scoreEg_; }
+  int phase() const { return phase_; }
+  void refreshEval();
+
   Piece pieceOn(Square sq) const;
   Bitboard pieces(Piece p) const { return pieces_[static_cast<int>(p)]; }
   Bitboard occ() const { return occ_; }
@@ -53,6 +59,10 @@ class Position {
   int halfmove_ = 0;
   int fullmove_ = 1;
   Bitboard hash_ = 0;
+
+  int scoreMg_ = 0;
+  int scoreEg_ = 0;
+  int phase_ = 0;
 
   friend class MoveGen;
   friend int perft(Position& pos, int depth);

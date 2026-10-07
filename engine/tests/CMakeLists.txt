@@ -7,7 +7,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-add_executable(engine_tests perft_test.cpp)
+add_executable(engine_tests perft_test.cpp eval_test.cpp features_test.cpp)
 target_link_libraries(engine_tests PRIVATE chess_engine GTest::gtest_main)
 target_compile_options(engine_tests PRIVATE -Wall -Wextra)
 

@@ -1,11 +1,16 @@
 #include "chess/search.hpp"
 
+#include "chess/book.hpp"
 #include "chess/eval.hpp"
 #include "chess/movegen.hpp"
+#include "chess/timeman.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <random>
+#include <thread>
+#include <vector>
 
 namespace chess {
 
@@ -29,65 +34,145 @@ bool isQuiet(const Move& m) {
   return !isCapture(m) && m.promotion == PieceType::None;
 }
 
-// Margins in centipawns.
+int captureValue(const Move& m) {
+  static const int kVal[] = {0, 100, 320, 330, 500, 900, 20000};
+  if (m.promotion != PieceType::None) {
+    return kVal[static_cast<int>(m.promotion)] - kVal[static_cast<int>(PieceType::Pawn)] +
+           (m.captured != Piece::None ? kVal[static_cast<int>(pieceType(m.captured))] : 0);
+  }
+  if (m.captured == Piece::None) return 0;
+  return kVal[static_cast<int>(pieceType(m.captured))];
+}
+
 constexpr int kRazorMargin[] = {0, 300, 450, 600};
 constexpr int kReverseFutilityMargin[] = {0, 150, 300, 500, 700, 900, 1100};
 constexpr int kFutilityMargin[] = {0, 150, 300, 450, 600, 750, 900};
+constexpr int kSeeMargin[] = {0, 100, 200, 300, 400, 500};
+constexpr int kDeltaMargin = 200;
+
+int lmrReduction(int depth, int moveIndex) {
+  if (depth < 3 || moveIndex < 3) return 0;
+  const double r = 0.5 + std::log(static_cast<double>(depth)) *
+                             std::log(static_cast<double>(moveIndex)) / 2.25;
+  return std::max(0, static_cast<int>(r));
+}
+
+size_t ttEntriesForMb(size_t mb) {
+  if (mb < 1) mb = 1;
+  if (mb > 1024) mb = 1024;
+  size_t entries = (mb * 1024ull * 1024ull) / sizeof(TTEntry);
+  // Round down to power of two.
+  size_t pow2 = 1;
+  while (pow2 * 2 <= entries) pow2 *= 2;
+  return std::max<size_t>(pow2, 1 << 16);
+}
 
 }  // namespace
 
-bool Searcher::shouldStop() const {
-  if (limits_.timeMs <= 0) return false;
-  if ((nodes_ & 2047) != 0) return stop_.load();
-  const auto now = std::chrono::steady_clock::now();
-  const auto ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(now - start_).count();
-  return ms >= limits_.timeMs;
+std::optional<Move> legalMoveFromUci(Position& pos, std::string_view uci) {
+  auto parsed = uciToMove(uci);
+  if (!parsed) return std::nullopt;
+  std::vector<Move> moves;
+  MoveGen::generateLegal(pos, moves);
+  for (const Move& m : moves) {
+    if (m.from == parsed->from && m.to == parsed->to && m.promotion == parsed->promotion) {
+      return m;
+    }
+  }
+  return std::nullopt;
 }
 
-bool Searcher::isRepetition(const Position& pos) const {
+SearchWorker::SearchWorker(SharedSearch& shared, bool isMain)
+    : shared_(shared), isMain_(isMain) {}
+
+void SearchWorker::clearLocal() {
+  std::fill(&killers_[0][0], &killers_[0][0] + 128 * 2, Move{});
+  std::fill(&counters_[0][0], &counters_[0][0] + 64 * 64, Move{});
+  std::fill(plyMove_, plyMove_ + 128, Move{});
+  std::memset(history_, 0, sizeof(history_));
+  localNodes_ = 0;
+  completedDepth_ = 0;
+  score_ = 0;
+  rootDepth_ = 0;
+  pvMove_ = {};
+  rootScores_.clear();
+}
+
+void SearchWorker::updateHistory(int& entry, int bonus) {
+  entry += bonus - entry * std::abs(bonus) / 512;
+  if (entry > kHistoryMax) entry = kHistoryMax;
+  if (entry < -kHistoryMax) entry = -kHistoryMax;
+}
+
+bool SearchWorker::isKiller(const Move& m, int ply) const {
+  return killers_[ply][0] == m || killers_[ply][1] == m;
+}
+
+bool SearchWorker::shouldStopHard() const {
+  if (shared_.stop.load(std::memory_order_relaxed)) return true;
+  if (shared_.limits.nodes > 0 &&
+      shared_.nodes.load(std::memory_order_relaxed) >= shared_.limits.nodes) {
+    return true;
+  }
+  if (shared_.hardMs <= 0) return false;
+  if ((localNodes_ & 2047) != 0) return false;
+  const auto now = std::chrono::steady_clock::now();
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - shared_.start).count();
+  return ms >= shared_.hardMs;
+}
+
+bool SearchWorker::pastSoftLimit() const {
+  if (shared_.softMs <= 0) return false;
+  const auto now = std::chrono::steady_clock::now();
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - shared_.start).count();
+  return ms >= shared_.softMs;
+}
+
+bool SearchWorker::isRepetition(const Position& pos) const {
   const int half = pos.halfmoveClock();
   if (half < 4 || repHistory_.size() < 2) return false;
   const Bitboard key = pos.hash();
-  int hits = 0;
-  // Walk back through reversible moves; skip the current entry at the end.
   const int start = static_cast<int>(repHistory_.size()) - 2;
   const int oldest = std::max(0, static_cast<int>(repHistory_.size()) - 1 - half);
   for (int i = start; i >= oldest; i -= 2) {
-    if (repHistory_[static_cast<size_t>(i)] == key) {
-      ++hits;
-      if (hits >= 1) return true;  // occurred earlier in the path → drawish
-    }
+    if (repHistory_[static_cast<size_t>(i)] == key) return true;
   }
   return false;
 }
 
-int Searcher::scoreToTT(int score, int ply) const {
+int SearchWorker::scoreToTT(int score, int ply) const {
   if (score > kMateScore - 1000) return score + ply;
   if (score < -kMateScore + 1000) return score - ply;
   return score;
 }
 
-int Searcher::scoreFromTT(int score, int ply) const {
+int SearchWorker::scoreFromTT(int score, int ply) const {
   if (score > kMateScore - 1000) return score - ply;
   if (score < -kMateScore + 1000) return score + ply;
   return score;
 }
 
-void Searcher::storeTT(Bitboard key, int score, int depth, int flag, const Move& best,
-                       int ply) {
-  TTEntry& e = tt_[key % kTTSize];
-  if (e.key == key && e.depth > depth) return;
+void SearchWorker::storeTT(Bitboard key, int score, int depth, int flag, const Move& best,
+                           int ply) {
+  TTEntry& slot = shared_.tt[key % shared_.ttSize];
+  TTEntry e = slot;
+  const bool sameKey = e.key == key;
+  if (sameKey && e.generation == shared_.generation && e.depth > depth) return;
+  if (!sameKey && e.generation == shared_.generation && e.depth > depth + 2) return;
   e.key = key;
   e.score = static_cast<int16_t>(scoreToTT(score, ply));
   e.depth = static_cast<int8_t>(depth);
   e.flag = static_cast<uint8_t>(flag);
+  e.generation = shared_.generation;
   e.bestMove = best;
+  slot = e;
 }
 
-bool Searcher::probeTT(Bitboard key, int depth, int alpha, int beta, int ply, int& score,
-                       Move& ttMove) {
-  TTEntry& e = tt_[key % kTTSize];
+bool SearchWorker::probeTT(Bitboard key, int depth, int alpha, int beta, int ply, int& score,
+                           Move& ttMove) {
+  const TTEntry e = shared_.tt[key % shared_.ttSize];
   if (e.key != key) return false;
   ttMove = e.bestMove;
   if (e.depth < depth) return false;
@@ -107,26 +192,54 @@ bool Searcher::probeTT(Bitboard key, int depth, int alpha, int beta, int ply, in
   return false;
 }
 
-SearchResult Searcher::search(Position& root, SearchLimits limits) {
-  limits_ = limits;
-  if (limits_.maxDepth <= 0) limits_.maxDepth = kMaxDepth;
-  if (limits_.maxDepth > kMaxDepth) limits_.maxDepth = kMaxDepth;
-  stop_ = false;
-  start_ = std::chrono::steady_clock::now();
-  nodes_ = 0;
-  if (tt_.size() != kTTSize) tt_.assign(kTTSize, {});
-  std::fill(&killers_[0][0], &killers_[0][0] + 128 * 2, Move{});
-  std::fill(&counters_[0][0], &counters_[0][0] + 64 * 64, Move{});
-  std::fill(plyMove_, plyMove_ + 128, Move{});
-  std::memset(history_, 0, sizeof(history_));
+Move SearchWorker::pickSkillRootMove(Position& root, const std::vector<Move>& rootMoves,
+                                     const Move& best) const {
+  const int skill = shared_.limits.skillLevel;
+  const int nCand = skillCandidateCount(skill);
+  if (nCand <= 1 || rootMoves.empty()) return best;
 
+  std::vector<std::pair<Move, int>> ranked = rootScores_;
+  if (ranked.empty()) {
+    // Fallback: static eval after each root move.
+    for (const Move& m : rootMoves) {
+      Undo undo;
+      root.makeMove(m, undo);
+      const int s = -evaluate(root);
+      root.unmakeMove(m, undo);
+      ranked.push_back({m, s});
+    }
+  }
+
+  std::sort(ranked.begin(), ranked.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  const int take = std::min(nCand, static_cast<int>(ranked.size()));
+  thread_local std::mt19937 rng{std::random_device{}()};
+  // Bias toward better moves but allow weaker ones at low skill.
+  std::vector<int> weights(static_cast<size_t>(take));
+  int total = 0;
+  for (int i = 0; i < take; ++i) {
+    weights[static_cast<size_t>(i)] = (take - i) * (take - i);
+    total += weights[static_cast<size_t>(i)];
+  }
+  std::uniform_int_distribution<int> dist(1, std::max(1, total));
+  int pick = dist(rng);
+  for (int i = 0; i < take; ++i) {
+    pick -= weights[static_cast<size_t>(i)];
+    if (pick <= 0) return ranked[static_cast<size_t>(i)].first;
+  }
+  return ranked.front().first;
+}
+
+SearchResult SearchWorker::run(Position& root) {
+  clearLocal();
   repHistory_.clear();
   repHistory_.push_back(root.hash());
 
   std::vector<Move> rootMoves;
   MoveGen::generateLegal(root, rootMoves);
   if (rootMoves.empty()) {
-    return {"", root.inCheck(root.sideToMove()) ? -kMateScore : 0, 0};
+    if (!isMain_) return {};
+    return {"", root.inCheck(root.sideToMove()) ? -kMateScore : 0, 0, false};
   }
 
   pvMove_ = rootMoves.front();
@@ -134,13 +247,21 @@ SearchResult Searcher::search(Position& root, SearchLimits limits) {
   completedDepth_ = 0;
 
   constexpr int kAspiration = 50;
+  const int maxDepth = shared_.limits.maxDepth;
 
-  for (int depth = 1; depth <= limits_.maxDepth; ++depth) {
+  for (int depth = 1; depth <= maxDepth; ++depth) {
+    if (shared_.stop.load(std::memory_order_relaxed)) break;
+    // Soft limit: do not start a new depth.
+    if (depth > 1 && pastSoftLimit()) break;
+    rootDepth_ = depth;
+    if (isMain_) rootScores_.clear();
+
     int alpha = -kInf;
     int beta = kInf;
+    const int asp = isMain_ ? kAspiration : kAspiration * 2;
     if (depth >= 4) {
-      alpha = score_ - kAspiration;
-      beta = score_ + kAspiration;
+      alpha = score_ - asp;
+      beta = score_ + asp;
     }
 
     int score = 0;
@@ -148,50 +269,63 @@ SearchResult Searcher::search(Position& root, SearchLimits limits) {
     int failHigh = 0;
     while (true) {
       score = negamax(root, depth, alpha, beta, 0, true);
-      if (stop_) break;
+      if (shared_.stop.load(std::memory_order_relaxed)) break;
       if (score <= alpha) {
         ++failLow;
-        alpha = (failLow >= 2) ? -kInf : score_ - kAspiration * (1 << failLow);
+        alpha = (failLow >= 2) ? -kInf : score_ - asp * (1 << failLow);
         continue;
       }
       if (score >= beta) {
         ++failHigh;
-        beta = (failHigh >= 2) ? kInf : score_ + kAspiration * (1 << failHigh);
+        beta = (failHigh >= 2) ? kInf : score_ + asp * (1 << failHigh);
         continue;
       }
       break;
     }
 
-    if (stop_) break;
+    if (shared_.stop.load(std::memory_order_relaxed)) break;
 
     score_ = score;
     completedDepth_ = depth;
+    if (isMain_ && shared_.infoFn) {
+      shared_.infoFn(depth, score_, shared_.nodes.load(std::memory_order_relaxed));
+    }
     if (std::abs(score) > kMateScore - 100) break;
   }
 
+  if (!isMain_) return {};
+
+  Move chosen = pvMove_;
+  if (shared_.limits.skillLevel < 20) {
+    chosen = pickSkillRootMove(root, rootMoves, pvMove_);
+  }
+
   SearchResult result;
-  result.bestMoveUci = moveToUci(pvMove_);
+  result.bestMoveUci = moveToUci(chosen);
   result.scoreCp = score_;
   result.depthReached = completedDepth_;
+  result.fromBook = false;
   return result;
 }
 
-int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
-                      bool allowNull) {
-  if (stop_.load() || shouldStop()) {
-    stop_ = true;
+int SearchWorker::negamax(Position& pos, int depth, int alpha, int beta, int ply,
+                          bool allowNull) {
+  if (shouldStopHard()) {
+    shared_.stop.store(true, std::memory_order_relaxed);
     return evaluate(pos);
   }
 
-  ++nodes_;
+  ++localNodes_;
+  shared_.nodes.fetch_add(1, std::memory_order_relaxed);
   if (pos.isDraw() || isRepetition(pos)) return 0;
   if (ply >= 120) return evaluate(pos);
 
   const bool inCheck = pos.inCheck(pos.sideToMove());
-  if (inCheck) ++depth;
+  if (inCheck && ply < 2 * rootDepth_) ++depth;
 
   if (depth <= 0) return quiescence(pos, alpha, beta, ply);
 
+  const bool pvNode = (beta - alpha) > 1;
   const Bitboard key = pos.hash();
   Move ttMove{};
   int ttScore = 0;
@@ -201,13 +335,11 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
 
   const int staticEval = evaluate(pos);
 
-  // Reverse futility pruning (static null-move).
   if (!inCheck && depth <= 6 && ply > 0 && beta < kMateScore - 1000) {
     const int margin = kReverseFutilityMargin[depth];
     if (staticEval - margin >= beta) return staticEval;
   }
 
-  // Razoring: if eval is far below alpha, drop into quiescence.
   if (!inCheck && depth <= 3 && ply > 0) {
     const int razor = staticEval + kRazorMargin[depth];
     if (razor <= alpha) {
@@ -216,17 +348,15 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
     }
   }
 
-  // Null-move pruning.
-  if (allowNull && !inCheck && depth >= 3 && beta < kInf - 100 &&
+  if (allowNull && !inCheck && !pvNode && depth >= 3 && beta < kInf - 100 &&
       pos.hasNonPawnMaterial(pos.sideToMove()) && staticEval >= beta) {
     const int R = 2 + depth / 4;
     NullUndo nundo;
     pos.makeNullMove(nundo);
-    // Null moves skip side; don't push to repetition stack.
     const int score = -negamax(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
     pos.unmakeNullMove(nundo);
-    if (stop_) return evaluate(pos);
-    if (score >= beta) return beta;
+    if (shared_.stop.load(std::memory_order_relaxed)) return evaluate(pos);
+    if (score >= beta) return score;
   }
 
   std::vector<Move> moves;
@@ -243,12 +373,30 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
   int flag = 1;
   int moveIndex = 0;
   int quietCount = 0;
+  Move quietTried[64];
+  int quietTriedCount = 0;
+  const int lmpLimit = 3 + depth * depth;
 
   Undo undo;
   for (const Move& m : moves) {
     const bool quiet = isQuiet(m);
+    const bool ttHit =
+        m.from == ttMove.from && m.to == ttMove.to && m.promotion == ttMove.promotion;
 
-    // Futility pruning of late quiet moves near the leaves.
+    if (!pvNode && !inCheck && quiet && ply > 0 && depth <= 8 && moveIndex >= lmpLimit &&
+        best > -kMateScore + 1000) {
+      ++moveIndex;
+      continue;
+    }
+
+    if (!pvNode && !inCheck && !quiet && !ttHit && ply > 0 && depth <= 5) {
+      const int margin = kSeeMargin[std::min(depth, 5)];
+      if (pos.see(m) < -margin) {
+        ++moveIndex;
+        continue;
+      }
+    }
+
     if (!inCheck && quiet && depth <= 6 && ply > 0 && best > -kMateScore + 1000) {
       const int futility = staticEval + kFutilityMargin[depth];
       if (futility <= alpha && quietCount >= 1) {
@@ -267,8 +415,9 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
       score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true);
     } else {
       int reduction = 0;
-      if (depth >= 3 && moveIndex >= 3 && quiet && !givesChk && !inCheck) {
-        reduction = 1 + (moveIndex >= 6) + (depth >= 6);
+      if (!pvNode && depth >= 3 && quiet && !givesChk && !inCheck && !ttHit &&
+          !isKiller(m, ply)) {
+        reduction = lmrReduction(depth, moveIndex);
         if (reduction >= depth) reduction = depth - 1;
       }
 
@@ -283,10 +432,26 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
 
     repHistory_.pop_back();
     pos.unmakeMove(m, undo);
-    if (quiet) ++quietCount;
+    if (quiet) {
+      ++quietCount;
+      if (quietTriedCount < 64) quietTried[quietTriedCount++] = m;
+    }
     ++moveIndex;
 
-    if (stop_) return evaluate(pos);
+    if (shared_.stop.load(std::memory_order_relaxed)) return evaluate(pos);
+
+    if (ply == 0 && isMain_) {
+      // Keep latest root move scores for skill selection.
+      bool found = false;
+      for (auto& rs : rootScores_) {
+        if (rs.first == m) {
+          rs.second = score;
+          found = true;
+          break;
+        }
+      }
+      if (!found) rootScores_.push_back({m, score});
+    }
 
     if (score > best) {
       best = score;
@@ -295,14 +460,19 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
     if (score > alpha) {
       alpha = score;
       flag = 0;
-      if (ply == 0) pvMove_ = m;
+      if (ply == 0 && isMain_) pvMove_ = m;
     }
     if (alpha >= beta) {
       flag = 2;
-      if (!isCapture(m)) {
+      if (quiet) {
         killers_[ply][1] = killers_[ply][0];
         killers_[ply][0] = m;
-        history_[static_cast<int>(m.from)][static_cast<int>(m.to)] += depth * depth;
+        const int bonus = depth * depth;
+        updateHistory(history_[static_cast<int>(m.from)][static_cast<int>(m.to)], bonus);
+        for (int i = 0; i < quietTriedCount - 1; ++i) {
+          const Move& q = quietTried[i];
+          updateHistory(history_[static_cast<int>(q.from)][static_cast<int>(q.to)], -bonus);
+        }
         if (ply > 0) {
           const Move prev = plyMove_[ply - 1];
           if (prev.from != Square::None) {
@@ -318,34 +488,32 @@ int Searcher::negamax(Position& pos, int depth, int alpha, int beta, int ply,
   return best;
 }
 
-int Searcher::quiescence(Position& pos, int alpha, int beta, int ply) {
-  if (stop_.load() || shouldStop()) {
-    stop_ = true;
+int SearchWorker::quiescence(Position& pos, int alpha, int beta, int ply) {
+  if (shouldStopHard()) {
+    shared_.stop.store(true, std::memory_order_relaxed);
     return evaluate(pos);
   }
-  ++nodes_;
+  ++localNodes_;
+  shared_.nodes.fetch_add(1, std::memory_order_relaxed);
   if (pos.isDraw() || isRepetition(pos)) return 0;
   if (ply >= 120) return evaluate(pos);
 
   const bool inCheck = pos.inCheck(pos.sideToMove());
+  int standPat = 0;
   if (!inCheck) {
-    const int standPat = evaluate(pos);
+    standPat = evaluate(pos);
     if (standPat >= beta) return beta;
     if (alpha < standPat) alpha = standPat;
   }
 
   std::vector<Move> moves;
-  MoveGen::generateLegal(pos, moves);
-
   if (inCheck) {
+    MoveGen::generateLegal(pos, moves);
     if (moves.empty()) return -kMateScore + ply;
   } else {
+    MoveGen::generateLegalCaptures(pos, moves);
     moves.erase(std::remove_if(moves.begin(), moves.end(),
-                               [&](const Move& m) {
-                                 if (!(isCapture(m) || m.promotion != PieceType::None))
-                                   return true;
-                                 return pos.see(m) < -50;
-                               }),
+                               [&](const Move& m) { return pos.see(m) < -50; }),
                 moves.end());
   }
 
@@ -353,20 +521,24 @@ int Searcher::quiescence(Position& pos, int alpha, int beta, int ply) {
 
   Undo undo;
   for (const Move& m : moves) {
+    if (!inCheck) {
+      if (standPat + captureValue(m) + kDeltaMargin <= alpha) continue;
+    }
+
     pos.makeMove(m, undo);
     repHistory_.push_back(pos.hash());
     const int score = -quiescence(pos, -beta, -alpha, ply + 1);
     repHistory_.pop_back();
     pos.unmakeMove(m, undo);
-    if (stop_) return evaluate(pos);
+    if (shared_.stop.load(std::memory_order_relaxed)) return evaluate(pos);
     if (score >= beta) return beta;
     if (score > alpha) alpha = score;
   }
   return alpha;
 }
 
-void Searcher::orderMoves(Position& pos, std::vector<Move>& moves, const Move& ttMove,
-                          int ply) {
+void SearchWorker::orderMoves(Position& pos, std::vector<Move>& moves, const Move& ttMove,
+                              int ply) {
   Move counter{};
   if (ply > 0) {
     const Move prev = plyMove_[ply - 1];
@@ -393,13 +565,86 @@ void Searcher::orderMoves(Position& pos, std::vector<Move>& moves, const Move& t
             [&](const Move& a, const Move& b) { return scoreMove(a) > scoreMove(b); });
 }
 
+void Searcher::setInfoCallback(SearchInfoFn fn) { shared_.infoFn = std::move(fn); }
+
+void Searcher::newGame() {
+  ++shared_.generation;
+  if (shared_.generation == 0) ++shared_.generation;
+}
+
+void Searcher::resizeHash(size_t mb) {
+  const size_t entries = ttEntriesForMb(mb);
+  if (entries != shared_.ttSize || shared_.tt.size() != entries) {
+    shared_.ttSize = entries;
+    shared_.tt.assign(entries, {});
+  }
+}
+
+SearchResult Searcher::search(Position& root, SearchLimits limits) {
+  applySkillLimits(limits);
+  shared_.limits = limits;
+  if (shared_.limits.maxDepth <= 0) shared_.limits.maxDepth = 64;
+  if (shared_.limits.maxDepth > 64) shared_.limits.maxDepth = 64;
+  if (shared_.limits.threads < 1) shared_.limits.threads = 1;
+  if (shared_.limits.threads > 64) shared_.limits.threads = 64;
+
+  if (limits.hashMb > 0) resizeHash(limits.hashMb);
+  if (shared_.tt.empty()) resizeHash(16);
+
+  if (limits.useBook) {
+    if (auto bookMove = globalBook().probe(root)) {
+      SearchResult r;
+      r.bestMoveUci = moveToUci(*bookMove);
+      r.scoreCp = 0;
+      r.depthReached = 0;
+      r.fromBook = true;
+      return r;
+    }
+  }
+
+  const TimeAllocation alloc = allocateTime(limits, root.sideToMove());
+  shared_.softMs = alloc.softMs;
+  shared_.hardMs = alloc.hardMs;
+
+  shared_.stop.store(false, std::memory_order_relaxed);
+  shared_.start = std::chrono::steady_clock::now();
+  shared_.nodes.store(0, std::memory_order_relaxed);
+  ++shared_.generation;
+  if (shared_.generation == 0) ++shared_.generation;
+
+  const int nThreads = shared_.limits.threads;
+  std::vector<std::thread> helpers;
+  helpers.reserve(static_cast<size_t>(nThreads - 1));
+
+  for (int t = 1; t < nThreads; ++t) {
+    helpers.emplace_back([this, root]() mutable {
+      Position copy = root;
+      SearchWorker worker(shared_, false);
+      worker.run(copy);
+    });
+  }
+
+  SearchWorker main(shared_, true);
+  SearchResult result = main.run(root);
+
+  shared_.stop.store(true, std::memory_order_relaxed);
+  for (auto& th : helpers) {
+    if (th.joinable()) th.join();
+  }
+  return result;
+}
+
+Searcher& globalSearcher() {
+  static Searcher instance;
+  return instance;
+}
+
 SearchResult findBestMove(const std::string& fen, SearchLimits limits) {
   Position pos;
   if (!pos.setFromFen(fen)) {
-    return {"", 0, 0};
+    return {"", 0, 0, false};
   }
-  Searcher searcher;
-  return searcher.search(pos, limits);
+  return globalSearcher().search(pos, limits);
 }
 
 }  // namespace chess

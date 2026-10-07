@@ -1,6 +1,7 @@
 #include "chess/position.hpp"
 
 #include "chess/bitboard.hpp"
+#include "chess/eval.hpp"
 #include "chess/zobrist.hpp"
 
 #include <algorithm>
@@ -46,9 +47,13 @@ void Position::refreshOcc() {
 void Position::xorPiece(Square sq, Piece p) {
   const int idx = static_cast<int>(p);
   const Bitboard mask = 1ULL << static_cast<int>(sq);
+  const bool adding = (pieces_[idx] & mask) == 0;
   pieces_[idx] ^= mask;
   occ_ ^= mask;
+  applyMaterialDelta(sq, p, adding ? +1 : -1, scoreMg_, scoreEg_, phase_);
 }
+
+void Position::refreshEval() { computeMaterial(*this, scoreMg_, scoreEg_, phase_); }
 
 bool Position::setFromFen(const std::string& fen) {
   pieces_.fill(0);
@@ -57,6 +62,9 @@ bool Position::setFromFen(const std::string& fen) {
   castling_ = 0;
   halfmove_ = 0;
   fullmove_ = 1;
+  scoreMg_ = 0;
+  scoreEg_ = 0;
+  phase_ = 0;
 
   std::istringstream iss(fen);
   std::string board, stm, castling, ep;
@@ -80,11 +88,9 @@ bool Position::setFromFen(const std::string& fen) {
     }
     auto piece = charToPiece(c);
     if (!piece) return false;
-    const int idx = static_cast<int>(*piece);
-    pieces_[idx] |= 1ULL << sq;
+    xorPiece(static_cast<Square>(sq), *piece);
     ++sq;
   }
-  refreshOcc();
 
   stm_ = (stm == "b") ? Color::Black : Color::White;
 

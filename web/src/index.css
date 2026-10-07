@@ -2,10 +2,23 @@
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: var(--font-body, 'Figtree', sans-serif);
+  background: #e7ece4;
+  color: #1c241c;
 }
 
 #root {
   min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
 }
