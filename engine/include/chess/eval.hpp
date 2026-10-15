@@ -11,9 +11,19 @@ void applyMaterialDelta(Square sq, Piece p, int sign, int& mg, int& eg, int& pha
 // Recompute material/PST/phase from the board (used by Position::refreshEval).
 void computeMaterial(const Position& pos, int& mg, int& eg, int& phase);
 
+// Side-to-move relative score. Uses NNUE when enabled and loaded; else classical.
 int evaluate(const Position& pos);
 
-// Full recompute of evaluate() without using the incremental cache (for tests/asserts).
+// Classical eval only (material + PST + positional + pawn hash). Ignores NNUE.
+int evaluateClassical(const Position& pos);
+
+// Full classical recompute without incremental material cache (for tests).
 int evaluateFull(const Position& pos);
+
+// Drawish endgame scale in [0, 128]; 128 = full weight.
+int endgameScaleFactor(const Position& pos);
+
+// Disable pawn hash for tests (returns previous value).
+bool setPawnHashEnabled(bool on);
 
 }  // namespace chess

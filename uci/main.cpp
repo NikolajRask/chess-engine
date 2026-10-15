@@ -1,6 +1,8 @@
 #include "chess/book.hpp"
 #include "chess/engine.hpp"
+#include "chess/game.hpp"
 #include "chess/movegen.hpp"
+#include "chess/nnue.hpp"
 #include "chess/search.hpp"
 
 #include <algorithm>
@@ -13,21 +15,25 @@ namespace {
 
 struct UciState {
   chess::Position pos;
+  std::vector<chess::Bitboard> hashHistory;
   chess::Searcher& searcher = chess::globalSearcher();
   int threads = 1;
   int skill = 20;
   bool ownBook = true;
   std::string bookFile;
   size_t hashMb = 16;
+  bool useNnue = false;
+  std::string evalFile = "nets/default.nnue";
 };
 
-void applyMoves(chess::Position& pos, const std::vector<std::string>& moves) {
-  for (const std::string& u : moves) {
-    auto m = chess::legalMoveFromUci(pos, u);
-    if (!m) break;
-    chess::Undo undo;
-    pos.makeMove(*m, undo);
-  }
+void resetPosition(UciState& st, const std::string& fen) {
+  st.pos.setFromFen(fen);
+  st.hashHistory.clear();
+  st.hashHistory.push_back(st.pos.hash());
+}
+
+void applyMoves(UciState& st, const std::vector<std::string>& moves) {
+  st.hashHistory = chess::applyUciMoves(st.pos, moves);
 }
 
 void cmdUci(UciState&) {
@@ -38,7 +44,9 @@ void cmdUci(UciState&) {
   std::cout << "option name Skill Level type spin default 20 min 0 max 20\n";
   std::cout << "option name OwnBook type check default true\n";
   std::cout << "option name BookFile type string default\n";
-  std::cout << "uciok\n";
+  std::cout << "option name UseNNUE type check default false\n";
+  std::cout << "option name EvalFile type string default nets/default.nnue\n";
+  std::cout << "uciok" << std::endl;
 }
 
 void cmdSetOption(UciState& st, std::istringstream& iss) {
@@ -73,7 +81,56 @@ void cmdSetOption(UciState& st, std::istringstream& iss) {
     } else {
       chess::globalBook().clearExternal();
     }
+  } else if (name == "UseNNUE") {
+    st.useNnue = (value == "true" || value == "1");
+    chess::nnue::setUseNnue(st.useNnue);
+  } else if (name == "EvalFile") {
+    st.evalFile = value;
+    if (st.evalFile.empty()) {
+      chess::nnue::unload();
+    } else if (chess::nnue::load(st.evalFile)) {
+      st.pos.refreshNnue();
+      chess::nnue::setUseNnue(st.useNnue);
+    } else {
+      std::cerr << "info string failed to load EvalFile " << st.evalFile << std::endl;
+    }
   }
+}
+
+void cmdBench(UciState& st) {
+  static const char* kFens[] = {
+      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "r3k2r/p1ppqpb1/bn2pnp1/3PP3/2P2P1q/2N2B1P/1P2PBP1/R2QK2R w KQkq - 0 1",
+  };
+  constexpr int kDepth = 10;
+  chess::SearchLimits lim;
+  lim.threads = 1;
+  lim.skillLevel = 20;
+  lim.useBook = false;
+  lim.hashMb = st.hashMb;
+  lim.maxDepth = kDepth;
+  lim.timeMs = 0;
+  lim.infinite = false;
+  lim.movetime = 0;
+  lim.wtime = 0;
+  lim.btime = 0;
+
+  std::uint64_t totalNodes = 0;
+  int totalMs = 0;
+  st.searcher.setInfoCallback({});
+  for (const char* fen : kFens) {
+    st.pos.setFromFen(fen);
+    st.searcher.newGame();
+    const chess::SearchResult r = st.searcher.search(st.pos, lim);
+    totalNodes += r.nodes;
+    totalMs += r.timeMs;
+    std::cout << "info string bench fen nodes " << r.nodes << " time " << r.timeMs
+              << " nps " << r.nps << " depth " << r.depthReached << std::endl;
+  }
+  const std::uint64_t nps =
+      totalMs > 0 ? (totalNodes * 1000ull) / static_cast<std::uint64_t>(totalMs) : 0;
+  std::cout << "info string bench total nodes " << totalNodes << " time " << totalMs
+            << " nps " << nps << std::endl;
 }
 
 void cmdGo(UciState& st, std::istringstream& iss) {
@@ -115,9 +172,27 @@ void cmdGo(UciState& st, std::istringstream& iss) {
               << std::endl;
   });
 
-  const chess::SearchResult result = st.searcher.search(st.pos, lim);
-  if (result.fromBook) {
-    std::cout << "info string book move\n";
+  const chess::SearchResult result = st.searcher.search(st.pos, lim, st.hashHistory);
+  if (result.gameOver) {
+    std::cout << "info string " << result.outcome << std::endl;
+  } else if (result.fromBook) {
+    std::cout << "info string book move" << std::endl;
+  } else if (!result.bestMoveUci.empty()) {
+    std::cout << "info depth " << result.depthReached;
+    if (result.scoreMate.has_value()) {
+      // UCI mate is in moves; convert from signed plies (ceil).
+      const int plies = *result.scoreMate;
+      const int moves = (std::abs(plies) + 1) / 2;
+      std::cout << " score mate " << (plies > 0 ? moves : -moves);
+    } else {
+      std::cout << " score cp " << result.scoreCp;
+    }
+    std::cout << " nodes " << result.nodes << " time " << result.timeMs << " nps " << result.nps;
+    if (!result.pv.empty()) {
+      std::cout << " pv";
+      for (const auto& m : result.pv) std::cout << ' ' << m;
+    }
+    std::cout << std::endl;
   }
   std::cout << "bestmove " << (result.bestMoveUci.empty() ? "0000" : result.bestMoveUci)
             << std::endl;
@@ -128,7 +203,12 @@ void cmdGo(UciState& st, std::istringstream& iss) {
 int main() {
   std::ios::sync_with_stdio(false);
   UciState st;
-  st.pos.setFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  if (chess::nnue::load(st.evalFile) || chess::nnue::loadDefault()) {
+    chess::nnue::setUseNnue(st.useNnue);
+  } else {
+    chess::nnue::setUseNnue(false);
+  }
+  resetPosition(st, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
   st.searcher.resizeHash(st.hashMb);
 
   std::string line;
@@ -142,16 +222,16 @@ int main() {
     if (cmd == "uci") {
       cmdUci(st);
     } else if (cmd == "isready") {
-      std::cout << "readyok\n";
+      std::cout << "readyok" << std::endl;
     } else if (cmd == "ucinewgame") {
       st.searcher.newGame();
-      st.pos.setFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+      resetPosition(st, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
     } else if (cmd == "position") {
       std::string type;
       iss >> type;
       std::vector<std::string> moves;
       if (type == "startpos") {
-        st.pos.setFromFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        resetPosition(st, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         std::string maybeMoves;
         if (iss >> maybeMoves && maybeMoves == "moves") {
           std::string m;
@@ -164,16 +244,18 @@ int main() {
           if (i) fen.push_back(' ');
           fen += part;
         }
-        st.pos.setFromFen(fen);
+        resetPosition(st, fen);
         std::string maybeMoves;
         if (iss >> maybeMoves && maybeMoves == "moves") {
           std::string m;
           while (iss >> m) moves.push_back(m);
         }
       }
-      applyMoves(st.pos, moves);
+      if (!moves.empty()) applyMoves(st, moves);
     } else if (cmd == "go") {
       cmdGo(st, iss);
+    } else if (cmd == "bench") {
+      cmdBench(st);
     } else if (cmd == "setoption") {
       cmdSetOption(st, iss);
     } else if (cmd == "stop") {

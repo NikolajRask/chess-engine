@@ -2,6 +2,7 @@
 
 #include "chess/bitboard.hpp"
 #include "chess/eval.hpp"
+#include "chess/nnue.hpp"
 #include "chess/zobrist.hpp"
 
 #include <algorithm>
@@ -51,9 +52,18 @@ void Position::xorPiece(Square sq, Piece p) {
   pieces_[idx] ^= mask;
   occ_ ^= mask;
   applyMaterialDelta(sq, p, adding ? +1 : -1, scoreMg_, scoreEg_, phase_);
+  if (nnue::loaded()) {
+    if (adding) {
+      nnue::addPiece(nnueAcc_, sq, p);
+    } else {
+      nnue::removePiece(nnueAcc_, sq, p);
+    }
+  }
 }
 
 void Position::refreshEval() { computeMaterial(*this, scoreMg_, scoreEg_, phase_); }
+
+void Position::refreshNnue() { nnue::refresh(*this, nnueAcc_); }
 
 bool Position::setFromFen(const std::string& fen) {
   pieces_.fill(0);
@@ -65,6 +75,7 @@ bool Position::setFromFen(const std::string& fen) {
   scoreMg_ = 0;
   scoreEg_ = 0;
   phase_ = 0;
+  nnueAcc_ = nnue::Accumulator{};
 
   std::istringstream iss(fen);
   std::string board, stm, castling, ep;
@@ -109,6 +120,7 @@ bool Position::setFromFen(const std::string& fen) {
   }
 
   hash_ = zobrist::hashPosition(*this);
+  if (nnue::loaded()) refreshNnue();
   return true;
 }
 
@@ -156,7 +168,48 @@ bool Position::inCheck(Color c) const {
   return bb::attackersTo(ksq, opposite(c), pieces_.data(), occ_) != 0;
 }
 
-bool Position::isDraw() const { return halfmove_ >= 100; }
+bool Position::isInsufficientMaterial() const {
+  const Bitboard wp = pieces(Piece::WPawn);
+  const Bitboard bp = pieces(Piece::BPawn);
+  const Bitboard wr = pieces(Piece::WRook);
+  const Bitboard br = pieces(Piece::BRook);
+  const Bitboard wq = pieces(Piece::WQueen);
+  const Bitboard bq = pieces(Piece::BQueen);
+  if (wp | bp | wr | br | wq | bq) return false;
+
+  const Bitboard wn = pieces(Piece::WKnight);
+  const Bitboard bn = pieces(Piece::BKnight);
+  const Bitboard wb = pieces(Piece::WBishop);
+  const Bitboard blackB = pieces(Piece::BBishop);
+  const int wN = bb::popcount(wn);
+  const int bN = bb::popcount(bn);
+  const int wB = bb::popcount(wb);
+  const int bB = bb::popcount(blackB);
+
+  // K vs K
+  if (wN + bN + wB + bB == 0) return true;
+
+  // K+B vs K or K+N vs K
+  if (wN + bN + wB + bB == 1) {
+    if (wN + bN == 1) return true;
+    if (wB + bB == 1) return true;
+  }
+
+  // K+B vs K+B, same square color
+  if (wN + bN == 0 && wB == 1 && bB == 1) {
+    const Square ws = bb::lsbSquare(wb);
+    const Square bs = bb::lsbSquare(blackB);
+    const int wColor = (fileOf(ws) + rankOf(ws)) & 1;
+    const int bColor = (fileOf(bs) + rankOf(bs)) & 1;
+    return wColor == bColor;
+  }
+
+  return false;
+}
+
+bool Position::isDraw() const {
+  return isFiftyMoveDraw() || isSeventyFiveMoveDraw() || isInsufficientMaterial();
+}
 
 bool Position::hasNonPawnMaterial(Color c) const {
   const int base = c == Color::White ? 0 : 6;
@@ -329,17 +382,18 @@ void Position::makeMove(const Move& move, Undo& undo) {
                                   (stm_ == Color::White ? 8 : -8));
   }
 
+  hash_ ^= zobrist::castling[castling_ & 15];
   if (moving == Piece::WKing) castling_ &= ~(kCastleWK | kCastleWQ);
   if (moving == Piece::BKing) castling_ &= ~(kCastleBK | kCastleBQ);
   if (move.from == Square::H1 || move.to == Square::H1) castling_ &= ~kCastleWK;
   if (move.from == Square::A1 || move.to == Square::A1) castling_ &= ~kCastleWQ;
   if (move.from == Square::H8 || move.to == Square::H8) castling_ &= ~kCastleBK;
   if (move.from == Square::A8 || move.to == Square::A8) castling_ &= ~kCastleBQ;
+  hash_ ^= zobrist::castling[castling_ & 15];
 
   if (stm_ == Color::Black) ++fullmove_;
   stm_ = opposite(stm_);
   hash_ ^= zobrist::side;
-  hash_ ^= zobrist::castling[castling_ & 15];
   if (undo.epSquare != Square::None) {
     hash_ ^= zobrist::epFile[fileOf(undo.epSquare)];
   }

@@ -2,8 +2,6 @@
 
 #include "chess/bitboard.hpp"
 
-#include <algorithm>
-
 namespace chess {
 
 namespace {
@@ -13,7 +11,7 @@ constexpr int kCastleWQ = 2;
 constexpr int kCastleBK = 4;
 constexpr int kCastleBQ = 8;
 
-void addMove(std::vector<Move>& moves, Move m) { moves.push_back(m); }
+void addMove(MoveList& moves, Move m) { moves.push(m); }
 
 Bitboard forwardPawns(Color c, Bitboard pawns) {
   return c == Color::White ? bb::northOne(pawns) : bb::southOne(pawns);
@@ -39,7 +37,7 @@ Bitboard friendlyOcc(const Position& pos, int usIdx) {
          pos.pieces(static_cast<Piece>(usIdx + 6));
 }
 
-void generatePseudo(Position& pos, std::vector<Move>& moves, bool capturesOnly) {
+void generatePseudo(Position& pos, MoveList& moves, bool capturesOnly) {
   moves.clear();
   const Color us = pos.sideToMove();
   const Color them = opposite(us);
@@ -227,41 +225,40 @@ void generatePseudo(Position& pos, std::vector<Move>& moves, bool capturesOnly) 
   }
 }
 
-void filterLegal(Position& pos, std::vector<Move>& moves) {
-  std::vector<Move> legal;
-  legal.reserve(moves.size());
+void filterLegal(Position& pos, MoveList& moves) {
+  MoveList legal;
   Undo undo;
   for (const Move& m : moves) {
     pos.makeMove(m, undo);
     if (!pos.inCheck(opposite(pos.sideToMove()))) {
-      legal.push_back(m);
+      legal.push(m);
     }
     pos.unmakeMove(m, undo);
   }
-  moves.swap(legal);
+  moves = legal;
 }
 
 }  // namespace
 
-void MoveGen::generatePseudoLegal(Position& pos, std::vector<Move>& moves) {
+void MoveGen::generatePseudoLegal(Position& pos, MoveList& moves) {
   generatePseudo(pos, moves, false);
 }
 
-void MoveGen::generateLegal(Position& pos, std::vector<Move>& moves) {
+void MoveGen::generateLegal(Position& pos, MoveList& moves) {
   generatePseudo(pos, moves, false);
   filterLegal(pos, moves);
 }
 
-void MoveGen::generateLegalCaptures(Position& pos, std::vector<Move>& moves) {
+void MoveGen::generateLegalCaptures(Position& pos, MoveList& moves) {
   generatePseudo(pos, moves, true);
   filterLegal(pos, moves);
 }
 
 int perft(Position& pos, int depth) {
   if (depth == 0) return 1;
-  std::vector<Move> moves;
+  MoveList moves;
   MoveGen::generateLegal(pos, moves);
-  if (depth == 1) return static_cast<int>(moves.size());
+  if (depth == 1) return moves.count();
 
   int nodes = 0;
   Undo undo;
@@ -271,6 +268,19 @@ int perft(Position& pos, int depth) {
     pos.unmakeMove(m, undo);
   }
   return nodes;
+}
+
+std::optional<Move> legalMoveFromUci(Position& pos, std::string_view uci) {
+  auto parsed = uciToMove(uci);
+  if (!parsed) return std::nullopt;
+  MoveList moves;
+  MoveGen::generateLegal(pos, moves);
+  for (const Move& m : moves) {
+    if (m.from == parsed->from && m.to == parsed->to && m.promotion == parsed->promotion) {
+      return m;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace chess

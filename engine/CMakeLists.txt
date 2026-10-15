@@ -1,12 +1,16 @@
 add_library(chess_engine
   src/types.cpp
   src/bitboard.cpp
+  src/magic.cpp
   src/position.cpp
   src/movegen.cpp
   src/zobrist.cpp
   src/eval.cpp
+  src/pawnhash.cpp
+  src/nnue.cpp
   src/timeman.cpp
   src/book.cpp
+  src/game.cpp
   src/search.cpp
   src/engine.cpp
 )

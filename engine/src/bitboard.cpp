@@ -1,5 +1,7 @@
 #include "chess/bitboard.hpp"
 
+#include "chess/magic.hpp"
+
 #include <cmath>
 #include <cstdlib>
 
@@ -15,9 +17,6 @@ Bitboard knightAttacks[64];
 Bitboard kingAttacks[64];
 
 namespace {
-
-constexpr Bitboard kFileA = 0x0101010101010101ULL;
-constexpr Bitboard kFileH = 0x8080808080808080ULL;
 
 constexpr int kKnightDeltas[8] = {17, 15, 10, 6, -6, -10, -15, -17};
 constexpr int kKingDeltas[8] = {8, -8, 1, -1, 9, 7, -7, -9};
@@ -38,24 +37,11 @@ Bitboard rayFrom(Square sq, int dir) {
   return ray;
 }
 
-Bitboard slidingAttacksOne(Square sq, Bitboard occ, int dir) {
-  Bitboard attacks = 0;
-  int f = fileOf(sq);
-  int r = rankOf(sq);
-  for (;;) {
-    f += kDirDf[dir];
-    r += kDirDr[dir];
-    if (f < 0 || f > 7 || r < 0 || r > 7) break;
-    const Square to = squareFrom(f, r);
-    attacks |= 1ULL << static_cast<int>(to);
-    if (occ & (1ULL << static_cast<int>(to))) break;
-  }
-  return attacks;
-}
-
 }  // namespace
 
 void init() {
+  magic::init();
+
   for (int sq = 0; sq < 64; ++sq) {
     Bitboard k = 0;
     for (int d : kKnightDeltas) {
@@ -140,13 +126,7 @@ void init() {
 }
 
 Bitboard slidingAttacks(Square sq, Bitboard occ, bool bishop) {
-  Bitboard attacks = 0;
-  const int start = bishop ? 0 : 4;
-  const int end = bishop ? 4 : 8;
-  for (int dir = start; dir < end; ++dir) {
-    attacks |= slidingAttacksOne(sq, occ, dir);
-  }
-  return attacks;
+  return bishop ? magic::bishopAttacks(sq, occ) : magic::rookAttacks(sq, occ);
 }
 
 Bitboard attackersTo(Square sq, Color byColor, const Bitboard pieces[13],

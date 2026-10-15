@@ -1,5 +1,6 @@
 #pragma once
 
+#include "chess/nnue.hpp"
 #include "chess/types.hpp"
 
 #include <array>
@@ -37,11 +38,18 @@ class Position {
   int phase() const { return phase_; }
   void refreshEval();
 
+  const nnue::Accumulator& nnueAcc() const { return nnueAcc_; }
+  void refreshNnue();
+
   Piece pieceOn(Square sq) const;
   Bitboard pieces(Piece p) const { return pieces_[static_cast<int>(p)]; }
   Bitboard occ() const { return occ_; }
 
   bool inCheck(Color c) const;
+  // Position-only draws (no move history): 50-move, 75-move, insufficient material.
+  bool isInsufficientMaterial() const;
+  bool isFiftyMoveDraw() const { return halfmove_ >= 100; }
+  bool isSeventyFiveMoveDraw() const { return halfmove_ >= 150; }
   bool isDraw() const;
   bool hasNonPawnMaterial(Color c) const;
   int see(const Move& move) const;
@@ -63,6 +71,8 @@ class Position {
   int scoreMg_ = 0;
   int scoreEg_ = 0;
   int phase_ = 0;
+
+  nnue::Accumulator nnueAcc_{};
 
   friend class MoveGen;
   friend int perft(Position& pos, int depth);

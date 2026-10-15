@@ -15,7 +15,7 @@ namespace {
 #include "polyglot_keys.inc"
 
 std::optional<Move> matchLegal(Position& pos, Square from, Square to, PieceType promo) {
-  std::vector<Move> moves;
+  MoveList moves;
   MoveGen::generateLegal(pos, moves);
   for (const Move& m : moves) {
     if (m.from == from && m.to == to && m.promotion == promo) return m;
