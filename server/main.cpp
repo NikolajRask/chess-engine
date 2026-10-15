@@ -80,6 +80,12 @@ int main() {
   httplib::Server svr;
   chess::Searcher& searcher = chess::globalSearcher();
 
+  // MultiPV / soft-limit extensions can exceed a few seconds; keep the socket open.
+  svr.set_read_timeout(60, 0);
+  svr.set_write_timeout(60, 0);
+  svr.set_keep_alive_timeout(60);
+  svr.set_keep_alive_max_count(1000);
+
   svr.Options(R"(/.*)", [](const httplib::Request& req, httplib::Response& res) {
     setCors(req, res);
     res.status = 204;
@@ -148,7 +154,11 @@ int main() {
   });
 
   const int port = 8080;
-  std::cout << "Chess server listening on http://localhost:" << port << std::endl;
-  svr.listen("0.0.0.0", port);
+  // Bind IPv4 loopback explicitly so `localhost` → ::1 mismatches cannot take the API down.
+  std::cout << "Chess server listening on http://127.0.0.1:" << port << std::endl;
+  if (!svr.listen("127.0.0.1", port)) {
+    std::cerr << "Failed to bind 127.0.0.1:" << port << std::endl;
+    return 1;
+  }
   return 0;
 }

@@ -9,6 +9,12 @@ if [[ ! -x "$ROOT/build/server/chess-server" ]]; then
   exit 1
 fi
 
+# Avoid duplicate listeners (overlapping old servers cause intermittent Failed to fetch).
+if command -v lsof >/dev/null 2>&1; then
+  lsof -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null || true
+  sleep 0.2
+fi
+
 "$ROOT/build/server/chess-server" &
 SERVER_PID=$!
 cleanup() {

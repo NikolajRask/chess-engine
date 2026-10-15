@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <thread>
 #include <vector>
@@ -58,6 +60,8 @@ int lmrReduction(int depth, int moveIndex) {
                              std::log(static_cast<double>(moveIndex)) / 2.25;
   return std::max(0, static_cast<int>(r));
 }
+
+constexpr int kProbCutMargin = 180;
 
 size_t ttClustersForMb(size_t mb) {
   if (mb < 1) mb = 1;
@@ -163,12 +167,10 @@ SearchWorker::SearchWorker(SharedSearch& shared, bool isMain)
     : shared_(shared), isMain_(isMain) {}
 
 void SearchWorker::clearLocal() {
+  // Killers / ply stack reset each search; history survives via loadHeuristics().
   std::fill(&killers_[0][0], &killers_[0][0] + 128 * 2, Move{});
-  std::fill(&counters_[0][0], &counters_[0][0] + 64 * 64, Move{});
   std::fill(plyMove_, plyMove_ + 128, Move{});
-  std::memset(history_, 0, sizeof(history_));
-  std::memset(contHistory_, 0, sizeof(contHistory_));
-  std::memset(captureHistory_, 0, sizeof(captureHistory_));
+  std::memset(evalStack_, 0, sizeof(evalStack_));
   localNodes_ = 0;
   completedDepth_ = 0;
   score_ = 0;
@@ -176,6 +178,34 @@ void SearchWorker::clearLocal() {
   pvMove_ = {};
   rootScores_.clear();
   multipvExclude_.clear();
+}
+
+void SearchWorker::loadHeuristics() {
+  const SearchHeuristics& h = shared_.heuristics;
+  std::memcpy(counters_, h.counters, sizeof(counters_));
+  std::memcpy(history_, h.history, sizeof(history_));
+  std::memcpy(contHistory_, h.contHistory, sizeof(contHistory_));
+  std::memcpy(captureHistory_, h.captureHistory, sizeof(captureHistory_));
+}
+
+void SearchWorker::saveHeuristics() {
+  SearchHeuristics& h = shared_.heuristics;
+  std::memcpy(h.counters, counters_, sizeof(counters_));
+  std::memcpy(h.history, history_, sizeof(history_));
+  std::memcpy(h.contHistory, contHistory_, sizeof(contHistory_));
+  std::memcpy(h.captureHistory, captureHistory_, sizeof(captureHistory_));
+}
+
+int SearchWorker::quietHistoryScore(const Move& m, int ply) const {
+  int score = history_[static_cast<int>(m.from)][static_cast<int>(m.to)];
+  if (ply > 0) {
+    const Move prev = plyMove_[ply - 1];
+    if (prev.from != Square::None) {
+      score += contHistory_[static_cast<int>(prev.to)][static_cast<int>(m.from)]
+                           [static_cast<int>(m.to)];
+    }
+  }
+  return score;
 }
 
 bool SearchWorker::isMultipvExcluded(const Move& m) const {
@@ -297,10 +327,12 @@ bool SearchWorker::pastSoftLimit() const {
 }
 
 bool SearchWorker::isRepetition(const Position& pos) const {
+  // repHistory_.back() is the current position (pushed by the caller). A repeat
+  // of the same STM needs at least 4 plies, so the first candidate is size-5.
   const int half = pos.halfmoveClock();
-  if (half < 4 || repHistory_.size() < 2) return false;
+  if (half < 4 || repHistory_.size() < 5) return false;
   const Bitboard key = pos.hash();
-  const int start = static_cast<int>(repHistory_.size()) - 2;
+  const int start = static_cast<int>(repHistory_.size()) - 5;
   const int oldest = std::max(0, static_cast<int>(repHistory_.size()) - 1 - half);
   for (int i = start; i >= oldest; i -= 2) {
     if (repHistory_[static_cast<size_t>(i)] == key) return true;
@@ -420,6 +452,7 @@ Move SearchWorker::pickSkillRootMove(Position& root, const MoveList& rootMoves,
 
 SearchResult SearchWorker::run(Position& root, const std::vector<Bitboard>& gameHistory) {
   clearLocal();
+  loadHeuristics();
   repHistory_.clear();
   if (!gameHistory.empty()) {
     repHistory_ = gameHistory;
@@ -489,6 +522,16 @@ SearchResult SearchWorker::run(Position& root, const std::vector<Bitboard>& game
       if (shared_.stop.load(std::memory_order_relaxed)) break;
       if (score <= alpha) {
         ++failLow;
+        // Unstable: spend more time when aspiration fails low.
+        if (isMain_ && shared_.initialSoftMs > 0) {
+          const int extend = std::max(20, shared_.initialSoftMs / 4);
+          const int softCap = shared_.initialSoftMs + shared_.initialSoftMs;
+          shared_.softMs = std::min(softCap, shared_.softMs + extend);
+          if (shared_.hardMs > 0) {
+            shared_.hardMs =
+                std::min(shared_.hardMs + extend, shared_.softMs + shared_.initialSoftMs / 2);
+          }
+        }
         alpha = (failLow >= 2) ? -kInf : score_ - asp * (1 << failLow);
         continue;
       }
@@ -515,6 +558,7 @@ SearchResult SearchWorker::run(Position& root, const std::vector<Bitboard>& game
     }
   }
 
+  if (isMain_) saveHeuristics();
   if (!isMain_) return {};
 
   SearchResult result;
@@ -585,10 +629,19 @@ int SearchWorker::negamax(Position& pos, int depth, int alpha, int beta, int ply
     return ttValue;
   }
 
+  // Internal iterative reduction: no TT move → search shallower first.
+  if (!excluding && ttMove.from == Square::None && depth >= 4) {
+    --depth;
+  }
+
   const int staticEval = evaluate(pos);
+  if (ply < 128) evalStack_[ply] = staticEval;
+  const bool improving =
+      ply >= 2 && !inCheck && staticEval > evalStack_[ply - 2];
 
   if (!inCheck && depth <= 6 && ply > 0 && beta < kMateScore - 1000) {
-    const int margin = kReverseFutilityMargin[depth];
+    int margin = kReverseFutilityMargin[depth];
+    if (improving) margin = margin * 3 / 4;
     if (staticEval - margin >= beta) return staticEval;
   }
 
@@ -602,7 +655,8 @@ int SearchWorker::negamax(Position& pos, int depth, int alpha, int beta, int ply
 
   if (allowNull && !excluding && !inCheck && !pvNode && depth >= 3 && beta < kInf - 100 &&
       pos.hasNonPawnMaterial(pos.sideToMove()) && staticEval >= beta) {
-    const int R = 2 + depth / 4;
+    int R = 2 + depth / 4;
+    if (improving) ++R;
     NullUndo nundo;
     pos.makeNullMove(nundo);
     const int score = -negamax(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
@@ -610,6 +664,29 @@ int SearchWorker::negamax(Position& pos, int depth, int alpha, int beta, int ply
     if (shared_.stop.load(std::memory_order_relaxed)) return evaluate(pos);
     // Do not trust unverified mate-score fail-highs from null move.
     if (score >= beta && std::abs(score) <= kMateScore - 1000) return score;
+  }
+
+  // ProbCut: reduced-depth capture search against a raised beta.
+  if (!pvNode && !excluding && !inCheck && depth >= 5 && std::abs(beta) < kMateScore - 1000 &&
+      staticEval >= beta + kProbCutMargin / 2) {
+    const int probBeta = beta + kProbCutMargin;
+    const int rDepth = depth - 3 - depth / 4;
+    MoveList caps;
+    MoveGen::generateLegalCaptures(pos, caps);
+    orderMoves(pos, caps, ttMove, ply);
+    Undo undoPc;
+    for (const Move& m : caps) {
+      if (pos.see(m) < kProbCutMargin / 2) continue;
+      pos.makeMove(m, undoPc);
+      repHistory_.push_back(pos.hash());
+      plyMove_[ply] = m;
+      const int score =
+          -negamax(pos, std::max(1, rDepth), -probBeta, -probBeta + 1, ply + 1, true);
+      repHistory_.pop_back();
+      pos.unmakeMove(m, undoPc);
+      if (shared_.stop.load(std::memory_order_relaxed)) return evaluate(pos);
+      if (score >= probBeta) return score;
+    }
   }
 
   MoveList moves;
@@ -688,9 +765,11 @@ int SearchWorker::negamax(Position& pos, int depth, int alpha, int beta, int ply
 
     const bool mayLmp = !pvNode && !inCheck && quiet && ply > 0 && depth <= 8 &&
                         moveIndex >= lmpLimit && best > -kMateScore + 1000;
+    int futMargin = kFutilityMargin[depth];
+    if (improving) futMargin = futMargin * 3 / 4;
     const bool mayFutile = !inCheck && quiet && depth <= 6 && ply > 0 &&
                            best > -kMateScore + 1000 && quietCount >= 1 &&
-                           staticEval + kFutilityMargin[depth] <= alpha;
+                           staticEval + futMargin <= alpha;
     if ((mayLmp || mayFutile) && !moveGivesCheck(m)) {
       ++moveIndex;
       continue;
@@ -718,6 +797,11 @@ int SearchWorker::negamax(Position& pos, int depth, int alpha, int beta, int ply
       if (!pvNode && depth >= 3 && quiet && !givesChk && !inCheck && !ttHit &&
           !isKiller(m, ply)) {
         reduction = lmrReduction(depth, moveIndex);
+        if (!improving) ++reduction;
+        const int hist = quietHistoryScore(m, ply);
+        if (hist > 2000) --reduction;
+        else if (hist < -1000) ++reduction;
+        if (reduction < 0) reduction = 0;
         if (reduction >= depth) reduction = depth - 1;
       }
 
@@ -848,24 +932,27 @@ int SearchWorker::quiescence(Position& pos, int alpha, int beta, int ply, int qs
     MoveGen::generateLegal(pos, moves);
     if (moves.empty()) return -kMateScore + ply;
   } else {
-    MoveGen::generateLegal(pos, moves);
-    const bool allowQuietChecks = qsPly < 2;
+    MoveGen::generateLegalCaptures(pos, moves);
     int n = 0;
-    Undo probe;
     for (int i = 0; i < moves.count(); ++i) {
-      const Move& m = moves[i];
-      const bool captureOrPromo = isCapture(m) || m.promotion != PieceType::None;
-      if (captureOrPromo) {
-        if (pos.see(m) >= -50) moves[n++] = m;
-        continue;
-      }
-      if (!allowQuietChecks || !isQuiet(m)) continue;
-      pos.makeMove(m, probe);
-      const bool givesChk = pos.inCheck(pos.sideToMove());
-      pos.unmakeMove(m, probe);
-      if (givesChk) moves[n++] = m;
+      if (pos.see(moves[i]) >= -50) moves[n++] = moves[i];
     }
     moves.size = n;
+
+    // Quiet checks for several QS plies so perpetuals can reach a 2-fold.
+    if (qsPly < 6) {
+      MoveList all;
+      MoveGen::generateLegal(pos, all);
+      Undo probe;
+      for (int i = 0; i < all.count(); ++i) {
+        const Move& m = all[i];
+        if (!isQuiet(m)) continue;
+        pos.makeMove(m, probe);
+        const bool givesChk = pos.inCheck(pos.sideToMove());
+        pos.unmakeMove(m, probe);
+        if (givesChk) moves.push(m);
+      }
+    }
   }
 
   orderMoves(pos, moves, ttMove, ply);
@@ -948,6 +1035,7 @@ void Searcher::setInfoCallback(SearchInfoFn fn) { shared_.infoFn = std::move(fn)
 void Searcher::newGame() {
   ++shared_.generation;
   if (shared_.generation == 0) ++shared_.generation;
+  shared_.heuristics.clear();
 }
 
 void Searcher::resizeHash(size_t mb) {
@@ -961,6 +1049,8 @@ void Searcher::resizeHash(size_t mb) {
 
 SearchResult Searcher::search(Position& root, SearchLimits limits,
                               const std::vector<Bitboard>& gameHistory) {
+  std::lock_guard<std::mutex> lock(searchMutex_);
+
   applySkillLimits(limits);
   shared_.limits = limits;
   if (shared_.limits.maxDepth <= 0) shared_.limits.maxDepth = 64;
@@ -1012,6 +1102,7 @@ SearchResult Searcher::search(Position& root, SearchLimits limits,
   const TimeAllocation alloc = allocateTime(limits, root.sideToMove());
   shared_.softMs = alloc.softMs;
   shared_.hardMs = alloc.hardMs;
+  shared_.initialSoftMs = alloc.softMs;
 
   shared_.stop.store(false, std::memory_order_relaxed);
   shared_.start = std::chrono::steady_clock::now();
@@ -1033,13 +1124,26 @@ SearchResult Searcher::search(Position& root, SearchLimits limits,
     });
   }
 
-  auto mainWorker = std::make_unique<SearchWorker>(shared_, true);
-  SearchResult result = mainWorker->run(root, gameHistory);
+  // Run the main worker on a normal-stack thread too. httplib request threads are
+  // ~512KB on macOS; MoveList frames (~3KB) + check extensions can blow that stack
+  // deep into a game even though SearchWorker itself is on the heap.
+  SearchResult result;
+  std::exception_ptr eptr;
+  std::thread mainTh([this, &root, &gameHistory, &result, &eptr]() {
+    try {
+      auto mainWorker = std::make_unique<SearchWorker>(shared_, true);
+      result = mainWorker->run(root, gameHistory);
+    } catch (...) {
+      eptr = std::current_exception();
+    }
+  });
+  mainTh.join();
 
   shared_.stop.store(true, std::memory_order_relaxed);
   for (auto& th : helpers) {
     if (th.joinable()) th.join();
   }
+  if (eptr) std::rethrow_exception(eptr);
   fillSearchStats(result, shared_);
   return result;
 }

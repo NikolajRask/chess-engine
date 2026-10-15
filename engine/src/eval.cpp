@@ -153,6 +153,65 @@ constexpr int kPstKingEnd[64] = {
 constexpr int kPassedBonus[8] = {0, 10, 20, 35, 55, 80, 120, 0};
 constexpr int kCandidateBonus[8] = {0, 5, 10, 15, 25, 40, 0, 0};
 constexpr int kConnectedPasser[8] = {0, 5, 10, 15, 25, 40, 60, 0};
+constexpr int kBackwardMg = 10;
+constexpr int kBackwardEg = 16;
+constexpr int kOutpostKnightMg = 28;
+constexpr int kOutpostKnightEg = 18;
+constexpr int kOutpostBishopMg = 18;
+constexpr int kOutpostBishopEg = 12;
+constexpr int kStormBonus[8] = {0, 0, 0, 8, 16, 28, 40, 0};
+constexpr int kHangingMg[] = {0, 0, 40, 45, 70, 110, 0};
+constexpr int kHangingEg[] = {0, 0, 28, 32, 50, 80, 0};
+constexpr int kPasserKingProxEg = 8;
+constexpr int kRookBehindPasserMg = 12;
+constexpr int kRookBehindPasserEg = 28;
+
+int chebyshev(Square a, Square b) {
+  return std::max(std::abs(fileOf(a) - fileOf(b)), std::abs(rankOf(a) - rankOf(b)));
+}
+
+bool isPassedPawn(Color us, Square sq, Bitboard theirPawns) {
+  const int f = fileOf(sq);
+  const int r = rankOf(sq);
+  Bitboard frontSpan = 0;
+  if (us == Color::White) {
+    for (int rr = r + 1; rr < 8; ++rr) {
+      for (int ff = std::max(0, f - 1); ff <= std::min(7, f + 1); ++ff) {
+        frontSpan |= 1ULL << static_cast<int>(squareFrom(ff, rr));
+      }
+    }
+  } else {
+    for (int rr = r - 1; rr >= 0; --rr) {
+      for (int ff = std::max(0, f - 1); ff <= std::min(7, f + 1); ++ff) {
+        frontSpan |= 1ULL << static_cast<int>(squareFrom(ff, rr));
+      }
+    }
+  }
+  return !(theirPawns & frontSpan);
+}
+
+bool isOutpostSquare(Color us, Square sq, Bitboard ourPawns, Bitboard theirPawns) {
+  const int f = fileOf(sq);
+  const int r = rankOf(sq);
+  const int relRank = us == Color::White ? r : 7 - r;
+  if (relRank < 4) return false;
+  // Must be protected by our pawn.
+  if (!(bb::pawnAttackers[static_cast<int>(us)][static_cast<int>(sq)] & ourPawns)) return false;
+  // No enemy pawn can attack this square (adjacent files ahead).
+  Bitboard leverage = 0;
+  if (us == Color::White) {
+    for (int rr = r + 1; rr < 8; ++rr) {
+      if (f > 0) leverage |= 1ULL << static_cast<int>(squareFrom(f - 1, rr));
+      if (f < 7) leverage |= 1ULL << static_cast<int>(squareFrom(f + 1, rr));
+    }
+  } else {
+    for (int rr = r - 1; rr >= 0; --rr) {
+      if (f > 0) leverage |= 1ULL << static_cast<int>(squareFrom(f - 1, rr));
+      if (f < 7) leverage |= 1ULL << static_cast<int>(squareFrom(f + 1, rr));
+    }
+  }
+  return !(theirPawns & leverage);
+}
 
 int mirror(int sq, Color c) { return c == Color::White ? sq : 63 - sq; }
 
@@ -284,6 +343,76 @@ void evalPawnStructure(const Position& pos, Color us, int& mid, int& end) {
       mid += kCandidateBonus[relRank];
       end += kCandidateBonus[relRank] * 2;
     }
+
+    // Backward: no friendly pawn support on adjacent files at/behind this rank,
+    // and the stop square is controlled by an enemy pawn.
+    if (!passed && relRank >= 1 && relRank <= 5) {
+      Bitboard support = 0;
+      if (us == Color::White) {
+        for (int rr = 0; rr <= r; ++rr) {
+          if (f > 0) support |= 1ULL << static_cast<int>(squareFrom(f - 1, rr));
+          if (f < 7) support |= 1ULL << static_cast<int>(squareFrom(f + 1, rr));
+        }
+      } else {
+        for (int rr = r; rr < 8; ++rr) {
+          if (f > 0) support |= 1ULL << static_cast<int>(squareFrom(f - 1, rr));
+          if (f < 7) support |= 1ULL << static_cast<int>(squareFrom(f + 1, rr));
+        }
+      }
+      if (!(ourPawns & support)) {
+        const int stopR = us == Color::White ? r + 1 : r - 1;
+        if (stopR >= 0 && stopR < 8) {
+          const Square stop = squareFrom(f, stopR);
+          if (bb::pawnAttacks[static_cast<int>(them)][static_cast<int>(stop)] & theirPawns) {
+            mid -= kBackwardMg;
+            end -= kBackwardEg;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Passer terms that depend on kings/rooks — kept outside the pawn hash.
+void evalPassedExtras(const Position& pos, Color us, int& mid, int& end) {
+  mid = 0;
+  end = 0;
+  const Color them = opposite(us);
+  const Bitboard ourPawns = pos.pieces(makePiece(us, PieceType::Pawn));
+  const Bitboard theirPawns = pos.pieces(makePiece(them, PieceType::Pawn));
+  const Bitboard ourRooks = pos.pieces(makePiece(us, PieceType::Rook));
+  const Bitboard ourKings = pos.pieces(makePiece(us, PieceType::King));
+  const Bitboard theirKings = pos.pieces(makePiece(them, PieceType::King));
+  if (!ourKings || !theirKings) return;
+  const Square ourKing = bb::lsbSquare(ourKings);
+  const Square theirKing = bb::lsbSquare(theirKings);
+
+  Bitboard pawns = ourPawns;
+  while (pawns) {
+    const Square sq = bb::lsbSquare(pawns);
+    pawns &= pawns - 1;
+    if (!isPassedPawn(us, sq, theirPawns)) continue;
+
+    const int f = fileOf(sq);
+    const int r = rankOf(sq);
+    const int relRank = us == Color::White ? r : 7 - r;
+    // King proximity: reward our king nearer and theirs farther (EG).
+    const int ourDist = chebyshev(ourKing, sq);
+    const int theirDist = chebyshev(theirKing, sq);
+    end += kPasserKingProxEg * (theirDist - ourDist) * (relRank + 1) / 4;
+
+    // Rook behind passer on the same file.
+    const Bitboard fileMask = 0x0101010101010101ULL << f;
+    Bitboard behind = 0;
+    if (us == Color::White) {
+      for (int rr = 0; rr < r; ++rr) behind |= 1ULL << static_cast<int>(squareFrom(f, rr));
+    } else {
+      for (int rr = r + 1; rr < 8; ++rr) behind |= 1ULL << static_cast<int>(squareFrom(f, rr));
+    }
+    if (ourRooks & behind & fileMask) {
+      mid += kRookBehindPasserMg;
+      end += kRookBehindPasserEg;
+    }
   }
 }
 
@@ -315,6 +444,10 @@ void evalNonPawnPositional(const Position& pos, Color us, int& mid, int& end) {
     const int mob = bb::popcount(bb::knightAttacks[static_cast<int>(from)] & ~friendly);
     mid += mob * 4;
     end += mob * 3;
+    if (isOutpostSquare(us, from, ourPawns, theirPawns)) {
+      mid += kOutpostKnightMg;
+      end += kOutpostKnightEg;
+    }
   }
 
   Bitboard bishops = pos.pieces(makePiece(us, PieceType::Bishop));
@@ -324,6 +457,10 @@ void evalNonPawnPositional(const Position& pos, Color us, int& mid, int& end) {
     const int mob = bb::popcount(bb::slidingAttacks(from, occ, true) & ~friendly);
     mid += mob * 3;
     end += mob * 3;
+    if (isOutpostSquare(us, from, ourPawns, theirPawns)) {
+      mid += kOutpostBishopMg;
+      end += kOutpostBishopEg;
+    }
   }
 
   Bitboard rooks = pos.pieces(makePiece(us, PieceType::Rook));
@@ -354,6 +491,24 @@ void evalNonPawnPositional(const Position& pos, Color us, int& mid, int& end) {
     const int mob = bb::popcount(attacks & ~friendly);
     mid += mob * 1;
     end += mob * 2;
+  }
+
+  // Hanging / undefended non-pawn pieces attacked by the opponent.
+  const PieceType hangTypes[] = {PieceType::Knight, PieceType::Bishop, PieceType::Rook,
+                                 PieceType::Queen};
+  for (PieceType pt : hangTypes) {
+    Bitboard bb = pos.pieces(makePiece(us, pt));
+    while (bb) {
+      const Square sq = bb::lsbSquare(bb);
+      bb &= bb - 1;
+      const Bitboard attacked = bb::attackersTo(sq, them, pos.pieceBoards().data(), occ);
+      if (!attacked) continue;
+      const Bitboard defended = bb::attackersTo(sq, us, pos.pieceBoards().data(), occ);
+      if (defended) continue;
+      const int idx = static_cast<int>(pt);
+      mid -= kHangingMg[idx];
+      end -= kHangingEg[idx];
+    }
   }
 
   Bitboard kings = pos.pieces(makePiece(us, PieceType::King));
@@ -388,6 +543,22 @@ void evalNonPawnPositional(const Position& pos, Color us, int& mid, int& end) {
     mid -= attackScore * 8;
     end -= attackScore * 2;
   }
+
+  // Pawn storm toward the enemy king.
+  const Bitboard theirKings = pos.pieces(makePiece(them, PieceType::King));
+  if (theirKings) {
+    const Square ek = bb::lsbSquare(theirKings);
+    const int ekf = fileOf(ek);
+    Bitboard stormPawns = ourPawns;
+    while (stormPawns) {
+      const Square sq = bb::lsbSquare(stormPawns);
+      stormPawns &= stormPawns - 1;
+      const int f = fileOf(sq);
+      if (std::abs(f - ekf) > 1) continue;
+      const int relRank = us == Color::White ? rankOf(sq) : 7 - rankOf(sq);
+      mid += kStormBonus[relRank];
+    }
+  }
 }
 
 void pawnStructureWhiteMinusBlack(const Position& pos, int& mid, int& end) {
@@ -418,12 +589,16 @@ int evaluateFromParts(int scoreMg, int scoreEg, int phase, const Position& pos) 
   int pMid = 0, pEnd = 0;
   pawnStructureWhiteMinusBlack(pos, pMid, pEnd);
 
+  int passWMid = 0, passWEnd = 0, passBMid = 0, passBEnd = 0;
+  evalPassedExtras(pos, Color::White, passWMid, passWEnd);
+  evalPassedExtras(pos, Color::Black, passBMid, passBEnd);
+
   int wMid = 0, wEnd = 0, bMid = 0, bEnd = 0;
   evalNonPawnPositional(pos, Color::White, wMid, wEnd);
   evalNonPawnPositional(pos, Color::Black, bMid, bEnd);
 
-  int mid = scoreMg + pMid + wMid - bMid;
-  int end = scoreEg + pEnd + wEnd - bEnd;
+  int mid = scoreMg + pMid + passWMid - passBMid + wMid - bMid;
+  int end = scoreEg + pEnd + passWEnd - passBEnd + wEnd - bEnd;
 
   if (pos.sideToMove() == Color::White) {
     mid += kTempoMg;

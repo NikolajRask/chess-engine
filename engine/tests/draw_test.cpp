@@ -91,5 +91,21 @@ TEST(DrawRules, SearchReportsStalemate) {
   EXPECT_EQ(r.scoreCp, 0);
 }
 
+// White is up a rook, but Black has a forced Qg3+/Qh3+ perpetual.
+// Depth 1 drops into QS mid-cycle; quiet checks must continue deep enough
+// for the 2-fold to score 0 (otherwise stand-pat leaks a non-draw eval).
+TEST(DrawRules, SearchSeesForcedPerpetual) {
+  Position pos;
+  ASSERT_TRUE(pos.setFromFen("6k1/5ppp/8/8/8/7q/8/Q4RK1 b - - 0 1"));
+  SearchLimits lim;
+  lim.useBook = false;
+  lim.timeMs = 2000;
+  lim.maxDepth = 1;
+  lim.skillLevel = 20;
+  const SearchResult r = globalSearcher().search(pos, lim, {pos.hash()});
+  EXPECT_FALSE(r.gameOver);
+  EXPECT_NEAR(r.scoreCp, 0, 50);
+}
+
 }  // namespace
 }  // namespace chess

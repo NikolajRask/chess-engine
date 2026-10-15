@@ -7,7 +7,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -69,6 +71,21 @@ constexpr int kTTClusterSize = 3;
 
 using SearchInfoFn = std::function<void(int depth, int scoreCp, std::uint64_t nodes)>;
 
+// Butterfly / continuation / capture history + countermoves surviving across searches.
+struct SearchHeuristics {
+  Move counters[64][64]{};
+  int history[64][64]{};
+  int contHistory[64][64][64]{};
+  int captureHistory[7][64][7]{};
+
+  void clear() {
+    std::memset(counters, 0, sizeof(counters));
+    std::memset(history, 0, sizeof(history));
+    std::memset(contHistory, 0, sizeof(contHistory));
+    std::memset(captureHistory, 0, sizeof(captureHistory));
+  }
+};
+
 struct SharedSearch {
   std::vector<TTEntry> tt;  // clusters of kTTClusterSize, contiguous
   size_t ttSize = 1 << 20;  // number of clusters (power of two)
@@ -79,7 +96,9 @@ struct SharedSearch {
   uint8_t generation = 0;
   int softMs = 0;
   int hardMs = 0;
+  int initialSoftMs = 0;  // original soft budget (for fail-low extension cap)
   SearchInfoFn infoFn;
+  SearchHeuristics heuristics{};
 };
 
 class SearchWorker {
@@ -109,8 +128,11 @@ class SearchWorker {
   bool probeTT(Bitboard key, int depth, int alpha, int beta, int ply, Move& ttMove,
                int& ttValue, int& ttDepth, int& ttFlag);
   void clearLocal();
+  void loadHeuristics();
+  void saveHeuristics();
   void updateHistory(int& entry, int bonus);
   bool isKiller(const Move& m, int ply) const;
+  int quietHistoryScore(const Move& m, int ply) const;
   Move pickSkillRootMove(Position& root, const MoveList& rootMoves, const Move& best) const;
   bool isMultipvExcluded(const Move& m) const;
   void fillMultipv(Position& root, SearchResult& result);
@@ -127,6 +149,8 @@ class SearchWorker {
   int contHistory_[64][64][64]{};
   // Capture: moving piece type × to × captured piece type.
   int captureHistory_[7][64][7]{};
+  // Static eval stack for improving heuristic.
+  int evalStack_[128]{};
 
   Move pvMove_{};
   int completedDepth_ = 0;
@@ -152,6 +176,9 @@ class Searcher {
 
  private:
   SharedSearch shared_;
+  // Serializes searches: the HTTP server can accept overlapping requests (e.g. client
+  // abort + new move) and they must not share TT / stop / heuristics concurrently.
+  std::mutex searchMutex_;
 };
 
 Searcher& globalSearcher();

@@ -4,7 +4,9 @@ import { Chessboard } from 'react-chessboard'
 import type { PieceDropHandlerArgs, PieceHandlerArgs, SquareHandlerArgs } from 'react-chessboard'
 import './App.css'
 
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8080'
+// Prefer 127.0.0.1 over localhost — on macOS localhost can resolve to ::1 while the
+// API binds IPv4 only, which surfaces as a cryptic "Failed to fetch".
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8080'
 const START_FEN = new Chess().fen()
 
 const LAST_MOVE_STYLE: CSSProperties = { backgroundColor: 'rgba(247, 247, 105, 0.8)' }
@@ -380,26 +382,46 @@ function App() {
       signal: AbortSignal,
       opts?: FetchBestMoveOpts,
     ): Promise<BestMoveResponse> => {
-      const res = await fetch(`${API_URL}/api/bestmove`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal,
-        body: JSON.stringify({
-          fen: currentFen,
-          startFen: START_FEN,
-          moves: ucis,
-          timeMs,
-          threads,
-          skillLevel: opts?.skillLevel ?? skillLevel,
-          useBook: opts?.useBook ?? useBook,
-          multiPv: opts?.multiPv ?? 1,
-        }),
+      const payload = JSON.stringify({
+        fen: currentFen,
+        startFen: START_FEN,
+        moves: ucis,
+        timeMs,
+        threads,
+        skillLevel: opts?.skillLevel ?? skillLevel,
+        useBook: opts?.useBook ?? useBook,
+        multiPv: opts?.multiPv ?? 1,
       })
-      if (!res.ok) {
-        const body = await res.text()
-        throw new Error(body || `HTTP ${res.status}`)
+
+      const doFetch = async () => {
+        const res = await fetch(`${API_URL}/api/bestmove`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: payload,
+        })
+        if (!res.ok) {
+          const body = await res.text()
+          throw new Error(body || `HTTP ${res.status}`)
+        }
+        return (await res.json()) as BestMoveResponse
       }
-      const data = (await res.json()) as BestMoveResponse
+
+      let data: BestMoveResponse
+      try {
+        data = await doFetch()
+      } catch (e) {
+        if (signal.aborted) throw e
+        // One retry for transient connection drops (keep-alive reuse / brief server blip).
+        const msg = e instanceof Error ? e.message : ''
+        if (msg === 'Failed to fetch' || e instanceof TypeError) {
+          await new Promise((r) => setTimeout(r, 200))
+          if (signal.aborted) throw e
+          data = await doFetch()
+        } else {
+          throw e
+        }
+      }
       return toWhitePov(data, currentFen)
     },
     [timeMs, threads, skillLevel, useBook],
@@ -450,7 +472,12 @@ function App() {
       } catch (e) {
         if (e instanceof DOMException && e.name === 'AbortError') return
         if (requestId !== requestIdRef.current) return
-        setError(e instanceof Error ? e.message : 'Failed to reach chess server')
+        const raw = e instanceof Error ? e.message : 'Failed to reach chess server'
+        setError(
+          raw === 'Failed to fetch'
+            ? 'Lost connection to the chess server (is it still running on port 8080?)'
+            : raw,
+        )
         setEngineRunning(false)
       } finally {
         if (requestId === requestIdRef.current) {
@@ -483,7 +510,12 @@ function App() {
       } catch (e) {
         if (e instanceof DOMException && e.name === 'AbortError') return
         if (requestId !== requestIdRef.current) return
-        setError(e instanceof Error ? e.message : 'Failed to reach chess server')
+        const raw = e instanceof Error ? e.message : 'Failed to reach chess server'
+        setError(
+          raw === 'Failed to fetch'
+            ? 'Lost connection to the chess server (is it still running on port 8080?)'
+            : raw,
+        )
       } finally {
         if (requestId === requestIdRef.current) {
           setThinking(false)
@@ -525,7 +557,12 @@ function App() {
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return
       if (requestId !== requestIdRef.current) return
-      setError(e instanceof Error ? e.message : 'Failed to reach chess server')
+      const raw = e instanceof Error ? e.message : 'Failed to reach chess server'
+      setError(
+        raw === 'Failed to fetch'
+          ? 'Lost connection to the chess server (is it still running on port 8080?)'
+          : raw,
+      )
     } finally {
       if (requestId === requestIdRef.current) {
         setThinking(false)
